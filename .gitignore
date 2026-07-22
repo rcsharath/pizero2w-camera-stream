@@ -1,0 +1,15 @@
+# Temporary images & test captures
+*.jpg
+*.jpeg
+*.png
+test_snapshot.jpg
+
+# Python cache & virtual environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# System files
+.DS_Store
+Thumbs.db
