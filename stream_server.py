@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Lightweight HTTP MJPEG Streaming Server for Raspberry Pi Zero 2W
-Optimized for consistency, zero CPU overhead resolution adjustments, and low RAM consumption (~15MB).
+Optimized for consistency, zero CPU overhead resolution adjustments, interactive cropping, and AWB color balance tuning.
 """
 
 import os
@@ -30,6 +30,12 @@ RESOLUTIONS = {
 current_res_key = "1296x972_15"
 current_width, current_height, current_fps, current_quality, _ = RESOLUTIONS[current_res_key]
 
+# Hardware ROI & AWB Color Tuning State (0% CPU Overhead)
+current_roi = None  # None or string "x,y,w,h" (normalized 0.0 to 1.0)
+current_awb = "auto"  # auto, indoor, incandescent, tungsten, custom
+current_red_gain = 1.70
+current_blue_gain = 1.40
+
 # Global state for latest JPEG frame and lock
 current_frame = None
 frame_lock = threading.Lock()
@@ -45,6 +51,10 @@ def camera_worker():
     while True:
         with frame_lock:
             w, h, fps, q = current_width, current_height, current_fps, current_quality
+            roi = current_roi
+            awb = current_awb
+            rgain = current_red_gain
+            bgain = current_blue_gain
             restart_requested = False
 
         cmd = [
@@ -61,8 +71,16 @@ def camera_worker():
             "-v", "0"
         ]
 
+        if awb == "custom":
+            cmd.extend(["--awbgains", f"{rgain:.2f},{bgain:.2f}"])
+        elif awb and awb != "auto":
+            cmd.extend(["--awb", awb])
+
+        if roi:
+            cmd.extend(["--roi", roi])
+
         try:
-            print(f"[Camera] Launching GPU hardware encoder ({w}x{h} @ {fps}fps, q={q})...")
+            print(f"[Camera] Launching GPU hardware encoder ({w}x{h} @ {fps}fps, awb={awb}, roi={roi})...")
             camera_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -130,6 +148,7 @@ HTML_PAGE = """<!DOCTYPE html>
             --text-muted: #94a3b8;
             --accent-color: #38bdf8;
             --success-color: #22c55e;
+            --warning-color: #f59e0b;
             --border-color: #334155;
         }
 
@@ -152,7 +171,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         header {
             width: 100%;
-            max-width: 800px;
+            max-width: 850px;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -199,7 +218,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         .main-card {
             width: 100%;
-            max-width: 800px;
+            max-width: 850px;
             background-color: var(--card-bg);
             border: 1px solid var(--border-color);
             border-radius: 12px;
@@ -215,6 +234,7 @@ HTML_PAGE = """<!DOCTYPE html>
             justify-content: center;
             align-items: center;
             position: relative;
+            overflow: hidden;
         }
 
         .video-container img {
@@ -222,6 +242,17 @@ HTML_PAGE = """<!DOCTYPE html>
             height: 100%;
             object-fit: contain;
             display: block;
+        }
+
+        /* Interactive Crop Box Overlay (0% Pi Overhead) */
+        #cropBox {
+            position: absolute;
+            border: 2px dashed #38bdf8;
+            background-color: rgba(56, 189, 248, 0.15);
+            pointer-events: none;
+            display: none;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.4);
+            z-index: 10;
         }
 
         .controls-bar {
@@ -232,6 +263,63 @@ HTML_PAGE = """<!DOCTYPE html>
             border-top: 1px solid var(--border-color);
             flex-wrap: wrap;
             gap: 0.75rem;
+        }
+
+        .tools-panel {
+            width: 100%;
+            max-width: 850px;
+            margin-top: 1rem;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .panel-box {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 1rem;
+        }
+
+        .panel-title {
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            color: var(--accent-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .slider-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .slider-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .slider-row label {
+            width: 90px;
+            color: var(--text-muted);
+        }
+
+        .slider-row input[type=range] {
+            flex: 1;
+            accent-color: var(--accent-color);
+        }
+
+        .slider-row span {
+            width: 45px;
+            text-align: right;
+            font-family: monospace;
         }
 
         .info-group {
@@ -267,7 +355,7 @@ HTML_PAGE = """<!DOCTYPE html>
             background-color: var(--accent-color);
             color: #0f172a;
             border: none;
-            padding: 0.5rem 1rem;
+            padding: 0.45rem 0.85rem;
             border-radius: 6px;
             font-weight: 600;
             font-size: 0.85rem;
@@ -289,10 +377,21 @@ HTML_PAGE = """<!DOCTYPE html>
             color: var(--text-color);
         }
 
+        .btn-warning {
+            background-color: var(--warning-color);
+            color: #0f172a;
+        }
+
         .header-actions {
             display: flex;
             align-items: center;
             gap: 0.5rem;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
         }
 
         footer {
@@ -314,32 +413,103 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="header-actions">
             <button class="btn btn-secondary" onclick="rotateCamera()">🔄 Rotate 90° (<span id="rotLabel">0°</span>)</button>
-            <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">
-                📷 Take Snapshot
-            </a>
+            <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">📷 Snapshot</a>
         </div>
     </header>
 
     <div class="main-card">
-        <div class="video-container">
+        <div class="video-container" id="videoContainer">
             <img src="/stream.mjpg" id="streamImg" alt="Live Stream Feed">
+            <div id="cropBox"></div>
         </div>
         <div class="controls-bar">
             <div class="info-group">
                 <label for="resSelect">Mode (Res & FPS):</label>
                 <select id="resSelect" onchange="changeResolution(this.value)">
-                    <option value="640x480_15">640×480 @ 15 FPS (Default - Balanced)</option>
-                    <option value="640x480_30">640×480 @ 30 FPS (Smooth Motion)</option>
-                    <option value="1280x720_15">1280×720 @ 15 FPS (HD Detail)</option>
-                    <option value="1280x720_30">1280×720 @ 30 FPS (Smooth HD)</option>
-                    <option value="1296x972_15">1296×972 @ 15 FPS (Full Frame Native)</option>
+                    <option value="1296x972_15">1296×972 @ 15 FPS (Full Frame Native - Default)</option>
                     <option value="2592x1944_10">2592×1944 @ 10 FPS (Full Frame Max 5MP)</option>
+                    <option value="1280x720_30">1280×720 @ 30 FPS (Smooth HD)</option>
+                    <option value="1280x720_15">1280×720 @ 15 FPS (HD Detail)</option>
+                    <option value="640x480_30">640×480 @ 30 FPS (Smooth Motion)</option>
+                    <option value="640x480_15">640×480 @ 15 FPS (Balanced)</option>
                     <option value="320x240_30">320×240 @ 30 FPS (Ultra-Low Latency)</option>
                     <option value="1920x1080_10">1920×1080 @ 10 FPS (Full HD)</option>
                 </select>
-                <div class="info-item">Current: <span id="fpsDisplay">640×480 @ 15 FPS</span></div>
+                <div class="info-item">Current: <span id="fpsDisplay">1296×972 @ 15 FPS</span></div>
             </div>
-            <button class="btn btn-secondary" onclick="reloadStream()">🔄 Refresh Stream</button>
+            <button class="btn btn-secondary" onclick="reloadStream()">🔄 Refresh</button>
+        </div>
+    </div>
+
+    <!-- Advanced Zero-Overhead Controls -->
+    <div class="tools-panel">
+        <!-- Interactive Crop Preview (0% Pi Overhead) -->
+        <div class="panel-box">
+            <div class="panel-title">
+                ✂️ Interactive Crop Preview
+                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">0% Pi Overhead</span>
+            </div>
+            <div class="slider-group">
+                <div class="slider-row">
+                    <label>Left Offset:</label>
+                    <input type="range" id="cropX" min="0" max="80" value="0" oninput="updateCropPreview()">
+                    <span id="cropValX">0%</span>
+                </div>
+                <div class="slider-row">
+                    <label>Top Offset:</label>
+                    <input type="range" id="cropY" min="0" max="80" value="0" oninput="updateCropPreview()">
+                    <span id="cropValY">0%</span>
+                </div>
+                <div class="slider-row">
+                    <label>Width:</label>
+                    <input type="range" id="cropW" min="20" max="100" value="100" oninput="updateCropPreview()">
+                    <span id="cropValW">100%</span>
+                </div>
+                <div class="slider-row">
+                    <label>Height:</label>
+                    <input type="range" id="cropH" min="20" max="100" value="100" oninput="updateCropPreview()">
+                    <span id="cropValH">100%</span>
+                </div>
+            </div>
+            <div class="btn-group">
+                <button class="btn" onclick="applyHardwareCrop()">✂️ Apply Hardware Crop</button>
+                <button class="btn btn-secondary" onclick="resetCrop()">🔄 Reset Full Frame</button>
+            </div>
+        </div>
+
+        <!-- Color Tuning / White Balance -->
+        <div class="panel-box">
+            <div class="panel-title">
+                🎨 Color Balance Tuning
+                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">Hardware ISP</span>
+            </div>
+            <div class="slider-group">
+                <div class="slider-row">
+                    <label for="awbSelect">AWB Mode:</label>
+                    <select id="awbSelect" style="flex:1;" onchange="toggleAwbMode(this.value)">
+                        <option value="auto">Auto (Default)</option>
+                        <option value="indoor">Indoor (Warm Neutral)</option>
+                        <option value="incandescent">Incandescent</option>
+                        <option value="tungsten">Tungsten</option>
+                        <option value="custom">Custom Red/Blue Gains</option>
+                    </select>
+                </div>
+                <div id="customGainsGroup" style="display: none;">
+                    <div class="slider-row" style="margin-top: 0.5rem;">
+                        <label>Red Gain:</label>
+                        <input type="range" id="redGain" min="1.0" max="3.0" step="0.05" value="1.70" oninput="updateGainLabels()">
+                        <span id="redGainVal">1.70</span>
+                    </div>
+                    <div class="slider-row">
+                        <label>Blue Gain:</label>
+                        <input type="range" id="blueGain" min="1.0" max="3.0" step="0.05" value="1.40" oninput="updateGainLabels()">
+                        <span id="blueGainVal">1.40</span>
+                    </div>
+                </div>
+            </div>
+            <div class="btn-group" style="margin-top: 1rem;">
+                <button class="btn" onclick="applyColorBalance()">🎨 Apply Color Tuning</button>
+            </div>
         </div>
     </div>
 
@@ -372,8 +542,84 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch('/set_resolution?res=' + val)
                 .then(res => res.json())
                 .then(data => {
-                    console.log('Mode changed:', data);
                     document.getElementById('fpsDisplay').innerText = data.width + '×' + data.height + ' @ ' + data.fps + ' FPS';
+                    setTimeout(reloadStream, 1500);
+                });
+        }
+
+        /* Interactive Visual Crop Preview (100% Browser Client-Side) */
+        function updateCropPreview() {
+            const x = parseInt(document.getElementById('cropX').value);
+            const y = parseInt(document.getElementById('cropY').value);
+            const w = parseInt(document.getElementById('cropW').value);
+            const h = parseInt(document.getElementById('cropH').value);
+
+            document.getElementById('cropValX').innerText = x + '%';
+            document.getElementById('cropValY').innerText = y + '%';
+            document.getElementById('cropValW').innerText = w + '%';
+            document.getElementById('cropValH').innerText = h + '%';
+
+            const cropBox = document.getElementById('cropBox');
+            if (x === 0 && y === 0 && w === 100 && h === 100) {
+                cropBox.style.display = 'none';
+            } else {
+                cropBox.style.display = 'block';
+                cropBox.style.left = x + '%';
+                cropBox.style.top = y + '%';
+                cropBox.style.width = Math.min(w, 100 - x) + '%';
+                cropBox.style.height = Math.min(h, 100 - y) + '%';
+            }
+        }
+
+        function applyHardwareCrop() {
+            const x = (parseInt(document.getElementById('cropX').value) / 100.0).toFixed(2);
+            const y = (parseInt(document.getElementById('cropY').value) / 100.0).toFixed(2);
+            const w = (parseInt(document.getElementById('cropW').value) / 100.0).toFixed(2);
+            const h = (parseInt(document.getElementById('cropH').value) / 100.0).toFixed(2);
+
+            fetch(`/set_crop?x=${x}&y=${y}&w=${w}&h=${h}`)
+                .then(res => res.json())
+                .then(data => {
+                    console.log('Crop applied:', data);
+                    setTimeout(reloadStream, 1500);
+                });
+        }
+
+        function resetCrop() {
+            document.getElementById('cropX').value = 0;
+            document.getElementById('cropY').value = 0;
+            document.getElementById('cropW').value = 100;
+            document.getElementById('cropH').value = 100;
+            updateCropPreview();
+
+            fetch('/set_crop?reset=1')
+                .then(res => res.json())
+                .then(data => {
+                    console.log('Crop reset:', data);
+                    setTimeout(reloadStream, 1500);
+                });
+        }
+
+        /* Color Balance Controls */
+        function toggleAwbMode(val) {
+            const gainsGroup = document.getElementById('customGainsGroup');
+            gainsGroup.style.display = (val === 'custom') ? 'block' : 'none';
+        }
+
+        function updateGainLabels() {
+            document.getElementById('redGainVal').innerText = parseFloat(document.getElementById('redGain').value).toFixed(2);
+            document.getElementById('blueGainVal').innerText = parseFloat(document.getElementById('blueGain').value).toFixed(2);
+        }
+
+        function applyColorBalance() {
+            const mode = document.getElementById('awbSelect').value;
+            const red = parseFloat(document.getElementById('redGain').value).toFixed(2);
+            const blue = parseFloat(document.getElementById('blueGain').value).toFixed(2);
+
+            fetch(`/set_awb?mode=${mode}&red=${red}&blue=${blue}`)
+                .then(res => res.json())
+                .then(data => {
+                    console.log('Color balance updated:', data);
                     setTimeout(reloadStream, 1500);
                 });
         }
@@ -385,6 +631,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         window.addEventListener('DOMContentLoaded', () => {
             applyRotation();
+            updateCropPreview();
         });
     </script>
 </body>
@@ -393,7 +640,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
 class StreamHandler(BaseHTTPRequestHandler):
-    """HTTP Handler supporting zero-overhead resolution & framerate adjustment."""
+    """HTTP Handler supporting zero-overhead resolution, crop, & color balance adjustment."""
 
     def log_message(self, format, *args):
         return
@@ -415,7 +662,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == '/set_resolution':
             query = parse_qs(parsed.query)
-            res = query.get('res', ['640x480_15'])[0]
+            res = query.get('res', ['1296x972_15'])[0]
 
             global current_res_key, current_width, current_height, current_fps, current_quality, restart_requested
 
@@ -433,6 +680,57 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             resp = f'{{"status":"ok","res":"{current_res_key}","width":{current_width},"height":{current_height},"fps":{current_fps}}}'
+            self.wfile.write(resp.encode('utf-8'))
+
+        elif parsed.path == '/set_crop':
+            query = parse_qs(parsed.query)
+            global current_roi
+
+            if 'reset' in query:
+                current_roi = None
+                restart_requested = True
+            elif 'x' in query and 'y' in query and 'w' in query and 'h' in query:
+                x = query['x'][0]
+                y = query['y'][0]
+                w = query['w'][0]
+                h = query['h'][0]
+                current_roi = f"{x},{y},{w},{h}"
+                restart_requested = True
+
+            if restart_requested and camera_process:
+                try:
+                    camera_process.terminate()
+                except Exception:
+                    pass
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            resp = f'{{"status":"ok","roi":"{current_roi}"}}'
+            self.wfile.write(resp.encode('utf-8'))
+
+        elif parsed.path == '/set_awb':
+            query = parse_qs(parsed.query)
+            global current_awb, current_red_gain, current_blue_gain
+
+            if 'mode' in query:
+                current_awb = query['mode'][0]
+            if 'red' in query:
+                current_red_gain = float(query['red'][0])
+            if 'blue' in query:
+                current_blue_gain = float(query['blue'][0])
+
+            restart_requested = True
+            if camera_process:
+                try:
+                    camera_process.terminate()
+                except Exception:
+                    pass
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            resp = f'{{"status":"ok","awb":"{current_awb}","red":{current_red_gain},"blue":{current_blue_gain}}}'
             self.wfile.write(resp.encode('utf-8'))
 
         elif parsed.path == '/snapshot.jpg':
