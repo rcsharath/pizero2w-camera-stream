@@ -13,3 +13,9 @@ venv/
 # System files
 .DS_Store
 Thumbs.db
+
+# Video recordings & lockfiles
+*.mp4
+*.mkv
+recorder.lock
+
