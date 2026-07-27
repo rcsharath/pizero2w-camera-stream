@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Lightweight HTTP MJPEG Streaming Server for Raspberry Pi Zero 2W
-Optimized for consistency, zero CPU overhead resolution adjustments, interactive cropping, and AWB color balance tuning.
+Optimized for consistency, zero CPU overhead resolution adjustments, interactive cropping, AWB color balance tuning, and live system metrics telemetry.
 """
 
 import os
 import sys
 import time
+import json
 import subprocess
 import threading
 from urllib.parse import parse_qs, urlparse
@@ -42,6 +43,35 @@ frame_lock = threading.Lock()
 frame_event = threading.Event()
 camera_process = None
 restart_requested = False
+
+
+def get_system_stats():
+    """Retrieve system telemetry directly from procfs with 0 external dependencies."""
+    stats = {"temp": 0.0, "ram_free_mb": 0, "ram_total_mb": 416, "cpu_load": "0.00"}
+    try:
+        if os.path.exists('/sys/class/thermal/thermal_zone0/temp'):
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                stats['temp'] = round(float(f.read().strip()) / 1000.0, 1)
+
+        if os.path.exists('/proc/meminfo'):
+            mem = {}
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        val = parts[1].split()[0].strip()
+                        mem[key] = int(val)
+            if 'MemTotal' in mem and 'MemAvailable' in mem:
+                stats['ram_total_mb'] = mem['MemTotal'] // 1024
+                stats['ram_free_mb'] = mem['MemAvailable'] // 1024
+
+        if os.path.exists('/proc/loadavg'):
+            with open('/proc/loadavg', 'r') as f:
+                stats['cpu_load'] = f.read().split()[0]
+    except Exception:
+        pass
+    return stats
 
 
 def camera_worker():
@@ -176,6 +206,8 @@ HTML_PAGE = """<!DOCTYPE html>
             justify-content: space-between;
             align-items: center;
             margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+            gap: 0.75rem;
         }
 
         .title-group {
@@ -216,6 +248,29 @@ HTML_PAGE = """<!DOCTYPE html>
             100% { opacity: 1; }
         }
 
+        .stats-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .stat-badge {
+            background-color: #1e293b;
+            border: 1px solid var(--border-color);
+            padding: 0.3rem 0.6rem;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            transition: all 0.3s ease;
+        }
+
+        .stat-badge span {
+            color: var(--text-color);
+            font-weight: 600;
+        }
+
         .main-card {
             width: 100%;
             max-width: 850px;
@@ -244,7 +299,6 @@ HTML_PAGE = """<!DOCTYPE html>
             display: block;
         }
 
-        /* Interactive Crop Box Overlay (0% Pi Overhead) */
         #cropBox {
             position: absolute;
             border: 2px dashed #38bdf8;
@@ -377,11 +431,6 @@ HTML_PAGE = """<!DOCTYPE html>
             color: var(--text-color);
         }
 
-        .btn-warning {
-            background-color: var(--warning-color);
-            color: #0f172a;
-        }
-
         .header-actions {
             display: flex;
             align-items: center;
@@ -411,6 +460,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 LIVE
             </div>
         </div>
+
+        <!-- System Telemetry Badges (0% Overhead) -->
+        <div class="stats-group">
+            <div class="stat-badge" id="tempBadge">🌡️ <span id="tempVal">--</span>°C</div>
+            <div class="stat-badge">🧠 <span id="ramVal">--</span> MB free</div>
+            <div class="stat-badge">⚡ Load: <span id="loadVal">--</span></div>
+        </div>
+
         <div class="header-actions">
             <button class="btn btn-secondary" onclick="rotateCamera()">🔄 Rotate 90° (<span id="rotLabel">0°</span>)</button>
             <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">📷 Snapshot</a>
@@ -547,7 +604,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 });
         }
 
-        /* Interactive Visual Crop Preview (100% Browser Client-Side) */
+        /* Interactive Visual Crop Preview */
         function updateCropPreview() {
             const x = parseInt(document.getElementById('cropX').value);
             const y = parseInt(document.getElementById('cropY').value);
@@ -580,7 +637,6 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch(`/set_crop?x=${x}&y=${y}&w=${w}&h=${h}`)
                 .then(res => res.json())
                 .then(data => {
-                    console.log('Crop applied:', data);
                     setTimeout(reloadStream, 1500);
                 });
         }
@@ -595,7 +651,6 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch('/set_crop?reset=1')
                 .then(res => res.json())
                 .then(data => {
-                    console.log('Crop reset:', data);
                     setTimeout(reloadStream, 1500);
                 });
         }
@@ -619,9 +674,31 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch(`/set_awb?mode=${mode}&red=${red}&blue=${blue}`)
                 .then(res => res.json())
                 .then(data => {
-                    console.log('Color balance updated:', data);
                     setTimeout(reloadStream, 1500);
                 });
+        }
+
+        /* System Telemetry Polling (0% Overhead) */
+        function pollStats() {
+            fetch('/stats')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('tempVal').innerText = data.temp;
+                    document.getElementById('ramVal').innerText = data.ram_free_mb;
+                    document.getElementById('loadVal').innerText = data.cpu_load;
+
+                    const tempBadge = document.getElementById('tempBadge');
+                    if (data.temp > 78) {
+                        tempBadge.style.borderColor = '#ef4444';
+                        tempBadge.style.color = '#ef4444';
+                    } else if (data.temp > 68) {
+                        tempBadge.style.borderColor = '#f59e0b';
+                        tempBadge.style.color = '#f59e0b';
+                    } else {
+                        tempBadge.style.borderColor = '#334155';
+                        tempBadge.style.color = 'var(--text-muted)';
+                    }
+                }).catch(() => {});
         }
 
         function reloadStream() {
@@ -632,6 +709,8 @@ HTML_PAGE = """<!DOCTYPE html>
         window.addEventListener('DOMContentLoaded', () => {
             applyRotation();
             updateCropPreview();
+            setInterval(pollStats, 3000);
+            pollStats();
         });
     </script>
 </body>
@@ -640,7 +719,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
 class StreamHandler(BaseHTTPRequestHandler):
-    """HTTP Handler supporting zero-overhead resolution, crop, & color balance adjustment."""
+    """HTTP Handler supporting zero-overhead resolution, crop, color balance, & telemetry."""
 
     def log_message(self, format, *args):
         return
@@ -659,6 +738,14 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(HTML_PAGE.encode('utf-8'))))
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode('utf-8'))
+
+        elif parsed.path == '/stats':
+            stats = get_system_stats()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.end_headers()
+            self.wfile.write(json.dumps(stats).encode('utf-8'))
 
         elif parsed.path == '/set_resolution':
             query = parse_qs(parsed.query)
