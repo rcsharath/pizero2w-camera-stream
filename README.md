@@ -14,9 +14,10 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
 - **🎨 Color Balance & White Balance Tuning:** Hardware ISP AWB presets (Indoor, Incandescent, Tungsten) and custom Red/Blue gain multipliers (`--awbgains`).
 - **📊 Real-Time System Telemetry:** Header metrics badges polling directly from procfs with zero overhead (`/stats` — CPU Temp °C, Free RAM MB, System Load).
 - **🎬 1-Click Windows Desktop Launchers:**
-  - `open_vlc_stream.bat` — Launches low-latency live H.264 stream playback in VLC Media Player (`--network-caching=300`).
-  - `record_stream.bat` — Continuous 24/7 recording into 90-second timestamped `.mp4` chunks (75% disk space savings vs MJPEG).
-- **🔒 Single-Instance Protection:** `record_stream.bat` includes automated lockfile protection (`recorder.lock`) to prevent duplicate recording instances.
+  - `record_and_preview.bat` — **Primary Entry Point:** Simultaneously records H.264 video into timestamped `.mp4` chunks AND launches live low-latency preview in VLC via PC-side UDP relay with 0% extra Pi CPU.
+  - `open_vlc_stream.bat` — Smart viewer script that connects to host UDP relay when recording, or falls back to direct Pi TCP stream when standalone.
+  - `record_stream.bat` — Multi-output FFmpeg recorder saving 90-second `.mp4` segments while broadcasting local UDP loopback (`udp://127.0.0.1:8889`).
+- **🔒 Single-Instance Protection & Auto-Cleanup:** Automated lockfile handling (`recorder.lock`) with active process checking (`ffmpeg.exe`) to prevent duplicate runs and auto-clear stale locks.
 - **📷 On-Demand 5MP Snapshot Engine (`/snapshot.jpg`):** Captures native 2592×1944 high-resolution stills on demand without interrupting the stream.
 - **⚙️ Autostart Systemd Service:** User-level `systemd` service (`camerastream.service`) for automatic boot launch without root privileges.
 
@@ -33,7 +34,7 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
 
 ---
 
-## 📐 System Architecture
+## 📐 System Architecture (PC-Side Stream Duplication & Preview)
 
 ```
    ┌─────────────────────────────────────────────────────────────┐
@@ -50,14 +51,19 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
    │      - Consumes ~2.7% CPU / Temp: ~48°C                     │
    └──────────────┬──────────────────────────────┬───────────────┘
                   │                              │
-                  │ (Raw H.264 Stream)           │ (HTTP Control API)
+                  │ (Single H.264 TCP Stream)    │ (HTTP Control API)
                   ▼                              ▼
    ┌─────────────────────────────────────────────────────────────┐
    │                      WINDOWS DESKTOP PC                     │
    │                                                             │
-   │   - open_vlc_stream.bat: 1-Click Live Viewer in VLC           │
-   │   - record_stream.bat: Continuous 24/7 MP4 Recorder        │
-   │   - Chrome Dashboard: http://rcsharathpi.local:8000         │
+   │  FFmpeg Multi-Output Stream Relay:                          │
+   │  ├── Output 1: Segmented MP4 Files (rec_YYYYMMDD_HHMMSS.mp4)│
+   │  └── Output 2: UDP Loopback Stream (udp://127.0.0.1:8889)   │
+   │                                                             │
+   │  Live Viewers & Controls:                                  │
+   │  ├── VLC Media Player (Previewing udp://@127.0.0.1:8889)    │
+   │  └── Web Dashboard (http://rcsharathpi.local:8000)          │
+   │      - Change color, crop, or exposure live while recording! │
    └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,10 +91,10 @@ systemctl --user enable --now camerastream.service
 loginctl enable-linger $USER
 ```
 
-### 3. Windows Desktop Usage
-* **View Live Stream in VLC:** Double-click `open_vlc_stream.bat` or open `tcp/h264://rcsharathpi.local:8888` in VLC.
-* **Continuous 24/7 Recording:** Double-click `record_stream.bat` to record timestamped 90-second `.mp4` video clips.
-* **Web Management Dashboard:** Open `http://rcsharathpi.local:8000` in Chrome to control camera modes, tweak color balance, crop, or view system stats.
+### 3. Windows Desktop Usage (Simultaneous Recording & Live Preview)
+* **1-Click Record & Live Preview (Recommended):** Double-click `record_and_preview.bat`. Launches FFmpeg stream recorder in background and opens VLC live preview instantly.
+* **Standalone Live Viewer:** Double-click `open_vlc_stream.bat`. Automatically uses host UDP relay if recording, or connects directly to Pi TCP stream if not recording.
+* **Web Management Dashboard:** Open `http://rcsharathpi.local:8000` in Chrome to tweak color balance, ROI crop, lighting presets, or system stats on the fly while recording.
 
 ---
 
