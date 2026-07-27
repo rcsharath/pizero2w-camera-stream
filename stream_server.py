@@ -37,6 +37,7 @@ current_mode = "day"  # day, night_outdoor, night_indoor
 current_awb = "auto"  # auto, indoor, incandescent, tungsten, custom
 current_red_gain = 1.70
 current_blue_gain = 1.40
+current_rotation = "0"  # "0", "180", "hflip", "vflip" (hardware ISP sensor transforms)
 
 # Global state
 camera_process = None
@@ -85,6 +86,7 @@ def camera_worker():
             awb = current_awb
             rgain = current_red_gain
             bgain = current_blue_gain
+            rot = current_rotation
             restart_requested = False
 
         cmd = [
@@ -124,8 +126,16 @@ def camera_worker():
         if roi:
             cmd.extend(["--roi", roi])
 
+        rot_str = str(rot)
+        if rot_str == "180":
+            cmd.extend(["--rotation", "180"])
+        elif rot_str == "hflip":
+            cmd.extend(["--hflip"])
+        elif rot_str == "vflip":
+            cmd.extend(["--vflip"])
+
         try:
-            print(f"[Camera H.264 GPU] Launching TCP Server on port {STREAM_TCP_PORT} ({w}x{h} @ {fps}fps, mode={mode}, awb={awb})...")
+            print(f"[Camera H.264 GPU] Launching TCP Server on port {STREAM_TCP_PORT} ({w}x{h} @ {fps}fps, mode={mode}, awb={awb}, rot={rot_str})...")
             camera_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -583,6 +593,29 @@ HTML_PAGE = """<!DOCTYPE html>
                 <button class="btn" onclick="applyColorBalance()">🎨 Apply Color Tuning</button>
             </div>
         </div>
+
+        <!-- Hardware GPU Orientation & Sensor Flips -->
+        <div class="panel-box">
+            <div class="panel-title">
+                🔄 Hardware Sensor Orientation & Flips
+                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">0% CPU Hardware ISP</span>
+            </div>
+            <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+                Apply native camera sensor hardware orientation & mirror transforms:
+            </div>
+            <div class="btn-group" style="flex-wrap: wrap;">
+                <button class="btn" id="rotBtn0" onclick="setHardwareRotation('0')">📱 0° (Normal)</button>
+                <button class="btn btn-secondary" id="rotBtn180" onclick="setHardwareRotation('180')">🙃 180° (Inverted)</button>
+                <button class="btn btn-secondary" id="rotBtnHflip" onclick="setHardwareRotation('hflip')">↔️ Horizontal Flip</button>
+                <button class="btn btn-secondary" id="rotBtnVflip" onclick="setHardwareRotation('vflip')">↕️ Vertical Flip</button>
+            </div>
+            <div style="margin-top: 0.75rem; font-size: 0.8rem; color: var(--text-muted);">
+                Active Mode: <strong id="activeRotLabel" style="color: var(--accent-color);">0° (Normal)</strong>
+            </div>
+            <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #94a3b8; background-color: #0f172a; padding: 0.4rem 0.6rem; border-radius: 4px;">
+                💡 <em>Note: 0°, 180°, and Mirror flips execute in camera hardware (0% CPU). For 90°/270° portrait rotation, use VLC Video Effects (Geometry) on host PC.</em>
+            </div>
+        </div>
     </div>
 
     <footer>
@@ -596,6 +629,37 @@ HTML_PAGE = """<!DOCTYPE html>
                 .then(data => {
                     console.log('Resolution set:', data);
                 });
+        }
+
+        function setHardwareRotation(rot) {
+            fetch('/set_rotation?rot=' + rot)
+                .then(res => res.json())
+                .then(data => {
+                    updateRotationUI(data.rotation);
+                    console.log('Hardware rotation applied:', data);
+                });
+        }
+
+        function updateRotationUI(rot) {
+            const rotStr = String(rot);
+            ['0', '180', 'hflip', 'vflip'].forEach(r => {
+                const btnId = r === 'hflip' ? 'rotBtnHflip' : (r === 'vflip' ? 'rotBtnVflip' : 'rotBtn' + r);
+                const btn = document.getElementById(btnId);
+                if (btn) {
+                    if (r === rotStr) {
+                        btn.classList.remove('btn-secondary');
+                        btn.classList.add('btn');
+                    } else {
+                        btn.classList.remove('btn');
+                        btn.classList.add('btn-secondary');
+                    }
+                }
+            });
+            const label = document.getElementById('activeRotLabel');
+            if (label) {
+                const names = {'0': '0° (Normal)', '180': '180° (Inverted)', 'hflip': 'Horizontal Flip', 'vflip': 'Vertical Flip'};
+                label.innerText = names[rotStr] || rotStr;
+            }
         }
 
         function setLightingMode(mode) {
@@ -715,7 +779,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global current_res_key, current_width, current_height, current_fps, current_quality
-        global current_roi, current_mode, current_awb, current_red_gain, current_blue_gain, restart_requested
+        global current_roi, current_mode, current_awb, current_red_gain, current_blue_gain, current_rotation, restart_requested
 
         parsed = urlparse(self.path)
 
@@ -804,10 +868,31 @@ class StreamHandler(BaseHTTPRequestHandler):
             resp = f'{{"status":"ok","awb":"{current_awb}","red":{current_red_gain},"blue":{current_blue_gain}}}'
             self.wfile.write(resp.encode('utf-8'))
 
+        elif parsed.path == '/set_rotation':
+            query = parse_qs(parsed.query)
+            if 'rot' in query:
+                rot_val = query['rot'][0]
+                if rot_val in ("0", "180", "hflip", "vflip") and rot_val != str(current_rotation):
+                    current_rotation = rot_val
+                    restart_requested = True
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            resp = f'{{"status":"ok","rotation":"{current_rotation}"}}'
+            self.wfile.write(resp.encode('utf-8'))
+
         elif parsed.path == '/snapshot.jpg':
             # Capture full 5MP still image using rpicam-still on demand
             try:
                 cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
+                rot_str = str(current_rotation)
+                if rot_str == "180":
+                    cmd.extend(["--rotation", "180"])
+                elif rot_str == "hflip":
+                    cmd.extend(["--hflip"])
+                elif rot_str == "vflip":
+                    cmd.extend(["--vflip"])
                 jpeg_data = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
                 self.send_response(200)
                 self.send_header('Content-Type', 'image/jpeg')
