@@ -12,6 +12,6 @@ echo ===================================================
 echo Press Ctrl+C in this window to stop recording at any time.
 echo.
 
-ffmpeg -i http://rcsharathpi.local:8000/stream.mjpg -c:v copy -f segment -segment_time 90 -reset_timestamps 1 -strftime 1 "rec_%%Y%%m%%d_%%H%%M%%S.mkv"
+ffmpeg -use_wallclock_as_timestamps 1 -i http://rcsharathpi.local:8000/stream.mjpg -c:v copy -f segment -segment_time 90 -reset_timestamps 1 -strftime 1 "rec_%%Y%%m%%d_%%H%%M%%S.mkv"
 
 pause
