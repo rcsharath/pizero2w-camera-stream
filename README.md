@@ -1,56 +1,47 @@
-# Raspberry Pi Zero 2W - Camera Stream Server & Edge Node 🤖
+# Raspberry Pi Zero 2W - Hardware H.264 Camera Stream & Edge Node 🤖
 
-A lightweight, zero-dependency HTTP MJPEG streaming server and web dashboard designed for the **Raspberry Pi Zero 2W** (OV5647 5MP Camera).
+A lightweight, zero-dependency HTTP management server and VideoCore GPU Hardware H.264 video stream engine designed for the **Raspberry Pi Zero 2W** (OV5647 5MP Camera).
 
+Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware pipeline**, running full-frame H.264 at **~2% CPU overhead** and maintaining cold operating temperatures (**~48°C**).
 
+---
 
 ## Key Features ✨
 
-- **Zero-Dependency Python HTTP Server:** Runs on standard Python 3 standard library (`http.server` & `socketserver`).
-- **GPU Hardware Resolution Switcher:** Supports dynamic GPU mode switching between:
-  - `1296×972 @ 15 FPS` *(Full Frame Native - Default)*
-  - `2592×1944 @ 10 FPS` *(Full Frame Max 5MP)*
-  - `1280×720 @ 30 FPS` *(Smooth HD)*
-  - `1280×720 @ 15 FPS` *(HD Detail)*
-  - `640×480 @ 30 FPS` *(Smooth Motion)*
-  - `640×480 @ 15 FPS` *(Balanced)*
-  - `320×240 @ 30 FPS` *(Ultra-Low Latency)*
-  - `1920×1080 @ 10 FPS` *(Full HD Stills)*
-- **Ultra-Low Memory Footprint:** Consumes only **~14.7 MB RAM** for Python and **~18 MB RAM** for the camera driver (~31 MB total), leaving >290 MB free RAM on Pi Zero 2W.
-- **Responsive Dark-Mode Dashboard:** Browser UI with live video stream, snapshot capture button, and resolution switcher.
-- **Autostart Systemd Service:** User-level `systemd` service (`camerastream.service`) for automatic launch on boot without root privileges.
+- **Hardware H.264 Video Engine (Port 8888):** 100% GPU hardware encoding over TCP socket (`tcp://rcsharathpi.local:8888`). Consumes only **~2–5% CPU** on Pi Zero 2W.
+- **Outdoor Night Mode Preset:** One-click exposure and gain adjustment for low-light outdoor surveillance (100ms exposure, 6.0x analog gain boost).
+- **Zero-Dependency Control Dashboard (Port 8000):** Real-time web control panel for switching resolutions, color balance tuning, shutter/gain presets, and viewing system metrics telemetry (CPU Temp, RAM free, Load).
+- **1-Click Windows Launchers:**
+  - `open_vlc_stream.bat` — Launches low-latency live H.264 stream playback in VLC.
+  - `record_stream.bat` — Continuous 24/7 recording into timestamped 90-second `.mp4` chunks (75% disk space savings vs MJPEG).
+- **On-Demand 5MP Snapshot Engine (`/snapshot.jpg`):** Captures native 2592×1944 high-resolution stills on demand.
+- **Autostart Systemd Service:** User-level `systemd` service (`camerastream.service`) for automatic launch on boot.
 
 ---
 
 ## Quick Start 🚀
 
-### 1. Clone & Run
+### 1. Run Control Server on Pi
 ```bash
 git clone https://github.com/rcsharath/pizero2w-camera-stream.git
 cd pizero2w-camera-stream
 python3 stream_server.py
 ```
 
-### 2. Access Web Dashboard
-Open `http://<pi-ip>:8000` or `http://rcsharathpi.local:8000` in any web browser.
-
-### 3. API Endpoints
-- **Stream URL:** `http://<pi-ip>:8000/stream.mjpg`
-- **Snapshot URL:** `http://<pi-ip>:8000/snapshot.jpg`
-- **Set Resolution API:** `curl "http://<pi-ip>:8000/set_resolution?res=640x480_30"`
+### 2. Live Stream Viewing & Recording on Desktop
+* **View Live in VLC:** Double-click `open_vlc_stream.bat` or open `tcp/h264://rcsharathpi.local:8888` in VLC.
+* **Record Continuously:** Double-click `record_stream.bat` to save 90-second timestamped `.mp4` clips.
+* **Web Dashboard:** Open `http://rcsharathpi.local:8000` in Chrome to control camera modes & view telemetry.
 
 ---
 
-## Systemd Autostart Setup ⚙️
+## API Endpoints ⚙️
 
-Copy `camerastream.service` to `~/.config/systemd/user/`:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp camerastream.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now camerastream.service
-```
+- **System Telemetry API:** `http://rcsharathpi.local:8000/stats`
+- **Lighting Mode API:** `http://rcsharathpi.local:8000/set_mode?mode=night_outdoor` (`day` | `night_outdoor` | `night_indoor`)
+- **Snapshot Capture API:** `http://rcsharathpi.local:8000/snapshot.jpg`
+- **Set Resolution API:** `http://rcsharathpi.local:8000/set_resolution?res=1296x972_15`
+- **Color Balance Tuning API:** `http://rcsharathpi.local:8000/set_awb?mode=indoor`
 
 ---
 

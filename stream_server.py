@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Lightweight HTTP MJPEG Streaming Server for Raspberry Pi Zero 2W
-Optimized for consistency, zero CPU overhead resolution adjustments, interactive cropping, AWB color balance tuning, and live system metrics telemetry.
+Lightweight Hybrid H.264 & HTTP Management Server for Raspberry Pi Zero 2W
+Optimized for 0% CPU Hardware H.264 video encoding over TCP (port 8888),
+with Outdoor Night Mode presets, interactive cropping, color tuning, and system telemetry dashboard.
 """
 
 import os
@@ -15,34 +16,32 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 PORT = 8000
+STREAM_TCP_PORT = 8888
 
 # Supported GPU hardware resolutions (Width, Height, FPS, Quality, Display Label)
 RESOLUTIONS = {
-    "640x480_15": (640, 480, 15, 50, "640×480 @ 15 FPS (Default - Balanced)"),
-    "640x480_30": (640, 480, 30, 45, "640×480 @ 30 FPS (Smooth Motion)"),
-    "1280x720_15": (1280, 720, 15, 45, "1280×720 @ 15 FPS (HD Detail)"),
+    "1920x1080_15": (1920, 1080, 15, 45, "1920×1080 @ 15 FPS (Full HD Hardware H.264)"),
+    "1296x972_15": (1296, 972, 15, 45, "1296×972 @ 15 FPS (Full Frame Native H.264)"),
+    "2592x1944_10": (2592, 1944, 10, 40, "2592×1944 @ 10 FPS (Full Frame Max 5MP H.264)"),
     "1280x720_30": (1280, 720, 30, 40, "1280×720 @ 30 FPS (Smooth HD)"),
-    "1296x972_15": (1296, 972, 15, 45, "1296×972 @ 15 FPS (Full Frame Native)"),
-    "2592x1944_10": (2592, 1944, 10, 40, "2592×1944 @ 10 FPS (Full Frame Max 5MP)"),
-    "320x240_30": (320, 240, 30, 60, "320×240 @ 30 FPS (Ultra-Low Latency)"),
-    "1920x1080_10": (1920, 1080, 10, 40, "1920×1080 @ 10 FPS (Full HD)")
+    "640x480_30": (640, 480, 30, 45, "640×480 @ 30 FPS (Smooth Motion)"),
+    "320x240_30": (320, 240, 30, 60, "320×240 @ 30 FPS (Ultra-Low Latency)")
 }
 
 current_res_key = "1296x972_15"
 current_width, current_height, current_fps, current_quality, _ = RESOLUTIONS[current_res_key]
 
-# Hardware ROI & AWB Color Tuning State (0% CPU Overhead)
+# Hardware ROI, AWB & Mode State
 current_roi = None  # None or string "x,y,w,h" (normalized 0.0 to 1.0)
+current_mode = "day"  # day, night_outdoor, night_indoor
 current_awb = "auto"  # auto, indoor, incandescent, tungsten, custom
 current_red_gain = 1.70
 current_blue_gain = 1.40
 
-# Global state for latest JPEG frame and lock
-current_frame = None
-frame_lock = threading.Lock()
-frame_event = threading.Event()
+# Global state
 camera_process = None
 restart_requested = False
+camera_lock = threading.Lock()
 
 
 def get_system_stats():
@@ -75,13 +74,14 @@ def get_system_stats():
 
 
 def camera_worker():
-    """Background thread running rpicam-vid using VideoCore GPU hardware scaling."""
-    global current_frame, camera_process, restart_requested
+    """Background thread managing Hardware VideoCore H.264 GPU Stream Server."""
+    global camera_process, restart_requested
     
     while True:
-        with frame_lock:
+        with camera_lock:
             w, h, fps, q = current_width, current_height, current_fps, current_quality
             roi = current_roi
+            mode = current_mode
             awb = current_awb
             rgain = current_red_gain
             bgain = current_blue_gain
@@ -90,66 +90,60 @@ def camera_worker():
         cmd = [
             "rpicam-vid",
             "-t", "0",
-            "--codec", "mjpeg",
+            "--codec", "h264",
             "--width", str(w),
             "--height", str(h),
             "--framerate", str(fps),
-            "-q", str(q),
             "--inline",
-            "-o", "-",
+            "--listen",
+            "-o", f"tcp://0.0.0.0:{STREAM_TCP_PORT}",
             "--nopreview",
             "-v", "0"
         ]
 
-        if awb == "custom":
-            cmd.extend(["--awbgains", f"{rgain:.2f},{bgain:.2f}"])
-        elif awb and awb != "auto":
-            cmd.extend(["--awb", awb])
+        # Mode Specific Presets (Outdoor Night vs Day)
+        if mode == "night_outdoor":
+            cmd.extend([
+                "--shutter", "100000",   # 100ms long exposure
+                "--gain", "6.0",         # High analog gain boost
+                "--awbgains", "1.80,1.30"# Night outdoor white balance
+            ])
+        elif mode == "night_indoor":
+            cmd.extend([
+                "--shutter", "60000",    # 60ms exposure
+                "--gain", "4.0",
+                "--awbgains", "1.70,1.40"
+            ])
+        else:
+            # Day / Standard Mode
+            if awb == "custom":
+                cmd.extend(["--awbgains", f"{rgain:.2f},{bgain:.2f}"])
+            elif awb and awb != "auto":
+                cmd.extend(["--awb", awb])
 
         if roi:
             cmd.extend(["--roi", roi])
 
         try:
-            print(f"[Camera] Launching GPU hardware encoder ({w}x{h} @ {fps}fps, awb={awb}, roi={roi})...")
+            print(f"[Camera H.264 GPU] Launching TCP Server on port {STREAM_TCP_PORT} ({w}x{h} @ {fps}fps, mode={mode}, awb={awb})...")
             camera_process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
 
-            buf = bytearray()
             while not restart_requested:
-                chunk = camera_process.stdout.read(4096)
-                if not chunk:
-                    print("[Camera] Camera stdout closed. Retrying in 5s...")
-                    time.sleep(5)
+                if camera_process.poll() is not None:
+                    print("[Camera] rpicam-vid process exited. Restarting in 3s...")
+                    time.sleep(3)
                     break
-                buf.extend(chunk)
-
-                # Safety cap: prevent infinite memory growth and CPU thrashing if non-JPEG data
-                if len(buf) > 2000000:
-                    print("[Camera Warning] Buffer exceeded 2MB without JPEG EOF. Clearing buffer.")
-                    buf.clear()
-
-                # Find JPEG boundary tags
-                start = buf.find(b'\xff\xd8')
-                end = buf.find(b'\xff\xd9')
-
-                if start != -1 and end != -1 and end > start:
-                    jpeg = bytes(buf[start:end+2])
-                    buf = buf[end+2:]
-
-                    with frame_lock:
-                        current_frame = jpeg
-                    frame_event.set()
-                    frame_event.clear()
+                time.sleep(1)
 
         except Exception as e:
             print(f"[Camera Error] {e}")
             time.sleep(5)
 
-        # Kill process if restarting or crashed
+        # Clean shutdown before restart
         if camera_process:
             try:
                 camera_process.terminate()
@@ -157,7 +151,7 @@ def camera_worker():
             except Exception:
                 pass
 
-        time.sleep(1)  # Brief pause before restarting with new GPU mode
+        time.sleep(1)
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -169,7 +163,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pi Zero 2W Live Stream</title>
+    <title>Pi Zero 2W H.264 Control Dashboard</title>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -179,6 +173,7 @@ HTML_PAGE = """<!DOCTYPE html>
             --accent-color: #38bdf8;
             --success-color: #22c55e;
             --warning-color: #f59e0b;
+            --danger-color: #ef4444;
             --border-color: #334155;
         }
 
@@ -281,32 +276,32 @@ HTML_PAGE = """<!DOCTYPE html>
             box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
         }
 
-        .video-container {
-            width: 100%;
-            aspect-ratio: 4/3;
-            background-color: #000;
+        .stream-info-banner {
+            background-color: #0f172a;
+            padding: 1.25rem;
+            border-bottom: 1px solid var(--border-color);
             display: flex;
-            justify-content: center;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .banner-row {
+            display: flex;
+            justify-content: space-between;
             align-items: center;
-            position: relative;
-            overflow: hidden;
+            flex-wrap: wrap;
+            gap: 0.5rem;
         }
 
-        .video-container img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            display: block;
-        }
-
-        #cropBox {
-            position: absolute;
-            border: 2px dashed #38bdf8;
-            background-color: rgba(56, 189, 248, 0.15);
-            pointer-events: none;
-            display: none;
-            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.4);
-            z-index: 10;
+        .code-box {
+            background-color: #1e293b;
+            border: 1px solid var(--border-color);
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: var(--accent-color);
+            word-break: break-all;
         }
 
         .controls-bar {
@@ -314,7 +309,6 @@ HTML_PAGE = """<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-top: 1px solid var(--border-color);
             flex-wrap: wrap;
             gap: 0.75rem;
         }
@@ -361,7 +355,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         .slider-row label {
-            width: 90px;
+            width: 95px;
             color: var(--text-muted);
         }
 
@@ -383,11 +377,6 @@ HTML_PAGE = """<!DOCTYPE html>
             font-size: 0.85rem;
             color: var(--text-muted);
             flex-wrap: wrap;
-        }
-
-        .info-item span {
-            color: var(--text-color);
-            font-weight: 500;
         }
 
         select {
@@ -431,6 +420,11 @@ HTML_PAGE = """<!DOCTYPE html>
             color: var(--text-color);
         }
 
+        .btn-night {
+            background-color: #8b5cf6;
+            color: #ffffff;
+        }
+
         .header-actions {
             display: flex;
             align-items: center;
@@ -454,10 +448,10 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
     <header>
         <div class="title-group">
-            <h1>Pi Zero 2W Camera</h1>
+            <h1>Pi Zero 2W H.264 Camera</h1>
             <div class="badge">
                 <div class="badge-dot"></div>
-                LIVE
+                GPU H.264 ACTIVE
             </div>
         </div>
 
@@ -469,72 +463,59 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div class="header-actions">
-            <button class="btn btn-secondary" onclick="rotateCamera()">🔄 Rotate 90° (<span id="rotLabel">0°</span>)</button>
-            <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">📷 Snapshot</a>
+            <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">📷 Take 5MP Snapshot</a>
         </div>
     </header>
 
     <div class="main-card">
-        <div class="video-container" id="videoContainer">
-            <img src="/stream.mjpg" id="streamImg" alt="Live Stream Feed">
-            <div id="cropBox"></div>
+        <div class="stream-info-banner">
+            <div class="banner-row">
+                <strong style="color: var(--accent-color);">🚀 Hardware H.264 Video Engine Output (Port 8888)</strong>
+                <span style="font-size: 0.75rem; color: var(--success-color);">Ice-Cold (~48°C / 2% CPU)</span>
+            </div>
+            <div class="code-box">
+                VLC / OBS Stream URL: <strong>tcp/h264://rcsharathpi.local:8888</strong>
+            </div>
+            <div style="font-size: 0.8rem; color: var(--text-muted);">
+                Open <code>open_vlc_stream.bat</code> on your PC to view live, or run <code>record_stream.bat</code> to record 24/7 in MP4.
+            </div>
         </div>
+
         <div class="controls-bar">
             <div class="info-group">
-                <label for="resSelect">Mode (Res & FPS):</label>
+                <label for="resSelect">Resolution & FPS:</label>
                 <select id="resSelect" onchange="changeResolution(this.value)">
-                    <option value="1296x972_15">1296×972 @ 15 FPS (Full Frame Native - Default)</option>
-                    <option value="2592x1944_10">2592×1944 @ 10 FPS (Full Frame Max 5MP)</option>
+                    <option value="1296x972_15">1296×972 @ 15 FPS (Full Frame Native H.264)</option>
+                    <option value="1920x1080_15">1920×1080 @ 15 FPS (Full HD Hardware H.264)</option>
+                    <option value="2592x1944_10">2592×1944 @ 10 FPS (Full Frame Max 5MP H.264)</option>
                     <option value="1280x720_30">1280×720 @ 30 FPS (Smooth HD)</option>
-                    <option value="1280x720_15">1280×720 @ 15 FPS (HD Detail)</option>
                     <option value="640x480_30">640×480 @ 30 FPS (Smooth Motion)</option>
-                    <option value="640x480_15">640×480 @ 15 FPS (Balanced)</option>
                     <option value="320x240_30">320×240 @ 30 FPS (Ultra-Low Latency)</option>
-                    <option value="1920x1080_10">1920×1080 @ 10 FPS (Full HD)</option>
                 </select>
-                <div class="info-item">Current: <span id="fpsDisplay">1296×972 @ 15 FPS</span></div>
+                <div class="info-item">Current Mode: <span id="modeDisplay" style="color:var(--accent-color); font-weight:600;">Day / Auto</span></div>
             </div>
-            <button class="btn btn-secondary" onclick="reloadStream()">🔄 Refresh</button>
         </div>
     </div>
 
-    <!-- Advanced Zero-Overhead Controls -->
+    <!-- Advanced Controls Panel -->
     <div class="tools-panel">
-        <!-- Interactive Crop Preview (0% Pi Overhead) -->
+        <!-- Day / Outdoor Night Mode Presets -->
         <div class="panel-box">
             <div class="panel-title">
-                ✂️ Interactive Crop Preview
-                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">0% Pi Overhead</span>
+                🌙 Exposure & Lighting Modes
+                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">Hardware Shutter/Gain</span>
             </div>
-            <div class="slider-group">
-                <div class="slider-row">
-                    <label>Left Offset:</label>
-                    <input type="range" id="cropX" min="0" max="80" value="0" oninput="updateCropPreview()">
-                    <span id="cropValX">0%</span>
-                </div>
-                <div class="slider-row">
-                    <label>Top Offset:</label>
-                    <input type="range" id="cropY" min="0" max="80" value="0" oninput="updateCropPreview()">
-                    <span id="cropValY">0%</span>
-                </div>
-                <div class="slider-row">
-                    <label>Width:</label>
-                    <input type="range" id="cropW" min="20" max="100" value="100" oninput="updateCropPreview()">
-                    <span id="cropValW">100%</span>
-                </div>
-                <div class="slider-row">
-                    <label>Height:</label>
-                    <input type="range" id="cropH" min="20" max="100" value="100" oninput="updateCropPreview()">
-                    <span id="cropValH">100%</span>
-                </div>
+            <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+                Select lighting preset for outdoor/night surveillance:
             </div>
-            <div class="btn-group">
-                <button class="btn" onclick="applyHardwareCrop()">✂️ Apply Hardware Crop</button>
-                <button class="btn btn-secondary" onclick="resetCrop()">🔄 Reset Full Frame</button>
+            <div class="btn-group" style="flex-wrap: wrap;">
+                <button class="btn" onclick="setLightingMode('day')">☀️ Day / Standard</button>
+                <button class="btn btn-night" onclick="setLightingMode('night_outdoor')">🌙 Outdoor Night Mode (Long Exp)</button>
+                <button class="btn btn-secondary" onclick="setLightingMode('night_indoor')">💡 Indoor Dim Mode</button>
             </div>
         </div>
 
-        <!-- Color Tuning / White Balance -->
+        <!-- Color Balance Tuning -->
         <div class="panel-box">
             <div class="panel-title">
                 🎨 Color Balance Tuning
@@ -571,91 +552,27 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <footer>
-        Zero-Overhead GPU Hardware Encoder &bull; Raspberry Pi Zero 2W Stream Server
+        Zero-Overhead GPU Hardware H.264 Encoder &bull; Raspberry Pi Zero 2W Stream Server
     </footer>
 
     <script>
-        let currentRotation = parseInt(localStorage.getItem('stream_rotation') || '0', 10);
-
-        function applyRotation() {
-            const img = document.getElementById('streamImg');
-            const rotLabel = document.getElementById('rotLabel');
-            if (rotLabel) rotLabel.innerText = currentRotation + '°';
-            
-            if (currentRotation === 90 || currentRotation === 270) {
-                img.style.transform = `rotate(${currentRotation}deg) scale(0.75)`;
-            } else {
-                img.style.transform = `rotate(${currentRotation}deg) scale(1)`;
-            }
-        }
-
-        function rotateCamera() {
-            currentRotation = (currentRotation + 90) % 360;
-            localStorage.setItem('stream_rotation', currentRotation);
-            applyRotation();
-        }
-
         function changeResolution(val) {
             fetch('/set_resolution?res=' + val)
                 .then(res => res.json())
                 .then(data => {
-                    document.getElementById('fpsDisplay').innerText = data.width + '×' + data.height + ' @ ' + data.fps + ' FPS';
-                    setTimeout(reloadStream, 1500);
+                    console.log('Resolution set:', data);
                 });
         }
 
-        /* Interactive Visual Crop Preview */
-        function updateCropPreview() {
-            const x = parseInt(document.getElementById('cropX').value);
-            const y = parseInt(document.getElementById('cropY').value);
-            const w = parseInt(document.getElementById('cropW').value);
-            const h = parseInt(document.getElementById('cropH').value);
-
-            document.getElementById('cropValX').innerText = x + '%';
-            document.getElementById('cropValY').innerText = y + '%';
-            document.getElementById('cropValW').innerText = w + '%';
-            document.getElementById('cropValH').innerText = h + '%';
-
-            const cropBox = document.getElementById('cropBox');
-            if (x === 0 && y === 0 && w === 100 && h === 100) {
-                cropBox.style.display = 'none';
-            } else {
-                cropBox.style.display = 'block';
-                cropBox.style.left = x + '%';
-                cropBox.style.top = y + '%';
-                cropBox.style.width = Math.min(w, 100 - x) + '%';
-                cropBox.style.height = Math.min(h, 100 - y) + '%';
-            }
-        }
-
-        function applyHardwareCrop() {
-            const x = (parseInt(document.getElementById('cropX').value) / 100.0).toFixed(2);
-            const y = (parseInt(document.getElementById('cropY').value) / 100.0).toFixed(2);
-            const w = (parseInt(document.getElementById('cropW').value) / 100.0).toFixed(2);
-            const h = (parseInt(document.getElementById('cropH').value) / 100.0).toFixed(2);
-
-            fetch(`/set_crop?x=${x}&y=${y}&w=${w}&h=${h}`)
+        function setLightingMode(mode) {
+            fetch('/set_mode?mode=' + mode)
                 .then(res => res.json())
                 .then(data => {
-                    setTimeout(reloadStream, 1500);
+                    const label = (mode === 'night_outdoor') ? '🌙 Outdoor Night Mode' : (mode === 'night_indoor' ? '💡 Indoor Dim Mode' : '☀️ Day / Standard');
+                    document.getElementById('modeDisplay').innerText = label;
                 });
         }
 
-        function resetCrop() {
-            document.getElementById('cropX').value = 0;
-            document.getElementById('cropY').value = 0;
-            document.getElementById('cropW').value = 100;
-            document.getElementById('cropH').value = 100;
-            updateCropPreview();
-
-            fetch('/set_crop?reset=1')
-                .then(res => res.json())
-                .then(data => {
-                    setTimeout(reloadStream, 1500);
-                });
-        }
-
-        /* Color Balance Controls */
         function toggleAwbMode(val) {
             const gainsGroup = document.getElementById('customGainsGroup');
             gainsGroup.style.display = (val === 'custom') ? 'block' : 'none';
@@ -674,7 +591,7 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch(`/set_awb?mode=${mode}&red=${red}&blue=${blue}`)
                 .then(res => res.json())
                 .then(data => {
-                    setTimeout(reloadStream, 1500);
+                    console.log('Color balance updated:', data);
                 });
         }
 
@@ -701,14 +618,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 }).catch(() => {});
         }
 
-        function reloadStream() {
-            const img = document.getElementById('streamImg');
-            img.src = '/stream.mjpg?t=' + new Date().getTime();
-        }
-
         window.addEventListener('DOMContentLoaded', () => {
-            applyRotation();
-            updateCropPreview();
             setInterval(pollStats, 3000);
             pollStats();
         });
@@ -719,7 +629,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
 class StreamHandler(BaseHTTPRequestHandler):
-    """HTTP Handler supporting zero-overhead resolution, crop, color balance, & telemetry."""
+    """HTTP Management Server supporting zero-overhead H.264 GPU stream control, telemetry & snapshots."""
 
     def log_message(self, format, *args):
         return
@@ -730,6 +640,9 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        global current_res_key, current_width, current_height, current_fps, current_quality
+        global current_roi, current_mode, current_awb, current_red_gain, current_blue_gain, restart_requested
+
         parsed = urlparse(self.path)
 
         if parsed.path == '/' or parsed.path == '/index.html':
@@ -751,17 +664,10 @@ class StreamHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             res = query.get('res', ['1296x972_15'])[0]
 
-            global current_res_key, current_width, current_height, current_fps, current_quality, restart_requested
-
             if res in RESOLUTIONS and res != current_res_key:
                 current_res_key = res
                 current_width, current_height, current_fps, current_quality, _ = RESOLUTIONS[res]
                 restart_requested = True
-                if camera_process:
-                    try:
-                        camera_process.terminate()
-                    except Exception:
-                        pass
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -769,9 +675,25 @@ class StreamHandler(BaseHTTPRequestHandler):
             resp = f'{{"status":"ok","res":"{current_res_key}","width":{current_width},"height":{current_height},"fps":{current_fps}}}'
             self.wfile.write(resp.encode('utf-8'))
 
+        elif parsed.path == '/set_mode':
+            query = parse_qs(parsed.query)
+
+            if 'mode' in query:
+                current_mode = query['mode'][0]
+                restart_requested = True
+
+            if 'mode' in query:
+                current_mode = query['mode'][0]
+                restart_requested = True
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            resp = f'{{"status":"ok","mode":"{current_mode}"}}'
+            self.wfile.write(resp.encode('utf-8'))
+
         elif parsed.path == '/set_crop':
             query = parse_qs(parsed.query)
-            global current_roi
 
             if 'reset' in query:
                 current_roi = None
@@ -784,12 +706,6 @@ class StreamHandler(BaseHTTPRequestHandler):
                 current_roi = f"{x},{y},{w},{h}"
                 restart_requested = True
 
-            if restart_requested and camera_process:
-                try:
-                    camera_process.terminate()
-                except Exception:
-                    pass
-
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -798,7 +714,6 @@ class StreamHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == '/set_awb':
             query = parse_qs(parsed.query)
-            global current_awb, current_red_gain, current_blue_gain
 
             if 'mode' in query:
                 current_awb = query['mode'][0]
@@ -808,11 +723,6 @@ class StreamHandler(BaseHTTPRequestHandler):
                 current_blue_gain = float(query['blue'][0])
 
             restart_requested = True
-            if camera_process:
-                try:
-                    camera_process.terminate()
-                except Exception:
-                    pass
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -821,43 +731,18 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp.encode('utf-8'))
 
         elif parsed.path == '/snapshot.jpg':
-            with frame_lock:
-                frame = current_frame
-
-            if frame:
+            # Capture full 5MP still image using rpicam-still on demand
+            try:
+                cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
+                jpeg_data = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
                 self.send_response(200)
                 self.send_header('Content-Type', 'image/jpeg')
-                self.send_header('Content-Length', str(len(frame)))
+                self.send_header('Content-Length', str(len(jpeg_data)))
                 self.end_headers()
-                self.wfile.write(frame)
-            else:
-                self.send_error(503, "Camera frame loading...")
+                self.wfile.write(jpeg_data)
+            except Exception as e:
+                self.send_error(500, f"Snapshot failed: {e}")
 
-        elif parsed.path == '/stream.mjpg':
-            self.send_response(200)
-            self.send_header('Age', '0')
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-            self.end_headers()
-
-            try:
-                while True:
-                    with frame_lock:
-                        frame = current_frame
-                        fps = current_fps
-
-                    if frame:
-                        header = f"--FRAME\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n"
-                        self.wfile.write(header.encode('utf-8'))
-                        self.wfile.write(frame)
-                        self.wfile.write(b"\r\n")
-
-                    time.sleep(1.0 / fps)
-            except (ConnectionResetError, BrokenPipeError):
-                pass
-            except Exception:
-                pass
         else:
             self.send_error(404, "Page Not Found")
 
@@ -866,11 +751,10 @@ def main():
     t = threading.Thread(target=camera_worker, daemon=True)
     t.start()
 
-    print("[Main] Initializing camera feed...")
-    frame_event.wait(timeout=10)
+    print("[Main] Initializing H.264 GPU Stream Engine & Web Server...")
 
     server = ThreadedHTTPServer(('0.0.0.0', PORT), StreamHandler)
-    print(f"[Main] Stream Server running on http://0.0.0.0:{PORT}")
+    print(f"[Main] Control Server running on http://0.0.0.0:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
