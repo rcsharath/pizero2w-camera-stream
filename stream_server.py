@@ -21,11 +21,13 @@ RESOLUTIONS = {
     "640x480_30": (640, 480, 30, 45, "640×480 @ 30 FPS (Smooth Motion)"),
     "1280x720_15": (1280, 720, 15, 45, "1280×720 @ 15 FPS (HD Detail)"),
     "1280x720_30": (1280, 720, 30, 40, "1280×720 @ 30 FPS (Smooth HD)"),
+    "1296x972_15": (1296, 972, 15, 45, "1296×972 @ 15 FPS (Full Frame Native)"),
+    "2592x1944_10": (2592, 1944, 10, 40, "2592×1944 @ 10 FPS (Full Frame Max 5MP)"),
     "320x240_30": (320, 240, 30, 60, "320×240 @ 30 FPS (Ultra-Low Latency)"),
     "1920x1080_10": (1920, 1080, 10, 40, "1920×1080 @ 10 FPS (Full HD)")
 }
 
-current_res_key = "640x480_15"
+current_res_key = "1296x972_15"
 current_width, current_height, current_fps, current_quality, _ = RESOLUTIONS[current_res_key]
 
 # Global state for latest JPEG frame and lock
@@ -72,9 +74,15 @@ def camera_worker():
             while not restart_requested:
                 chunk = camera_process.stdout.read(4096)
                 if not chunk:
-                    print("[Camera] Camera stdout closed.")
+                    print("[Camera] Camera stdout closed. Retrying in 5s...")
+                    time.sleep(5)
                     break
                 buf.extend(chunk)
+
+                # Safety cap: prevent infinite memory growth and CPU thrashing if non-JPEG data
+                if len(buf) > 2000000:
+                    print("[Camera Warning] Buffer exceeded 2MB without JPEG EOF. Clearing buffer.")
+                    buf.clear()
 
                 # Find JPEG boundary tags
                 start = buf.find(b'\xff\xd8')
@@ -91,6 +99,7 @@ def camera_worker():
 
         except Exception as e:
             print(f"[Camera Error] {e}")
+            time.sleep(5)
 
         # Kill process if restarting or crashed
         if camera_process:
@@ -280,6 +289,12 @@ HTML_PAGE = """<!DOCTYPE html>
             color: var(--text-color);
         }
 
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
         footer {
             margin-top: 2rem;
             font-size: 0.8rem;
@@ -297,9 +312,12 @@ HTML_PAGE = """<!DOCTYPE html>
                 LIVE
             </div>
         </div>
-        <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">
-            📷 Take Snapshot
-        </a>
+        <div class="header-actions">
+            <button class="btn btn-secondary" onclick="rotateCamera()">🔄 Rotate 90° (<span id="rotLabel">0°</span>)</button>
+            <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">
+                📷 Take Snapshot
+            </a>
+        </div>
     </header>
 
     <div class="main-card">
@@ -314,6 +332,8 @@ HTML_PAGE = """<!DOCTYPE html>
                     <option value="640x480_30">640×480 @ 30 FPS (Smooth Motion)</option>
                     <option value="1280x720_15">1280×720 @ 15 FPS (HD Detail)</option>
                     <option value="1280x720_30">1280×720 @ 30 FPS (Smooth HD)</option>
+                    <option value="1296x972_15">1296×972 @ 15 FPS (Full Frame Native)</option>
+                    <option value="2592x1944_10">2592×1944 @ 10 FPS (Full Frame Max 5MP)</option>
                     <option value="320x240_30">320×240 @ 30 FPS (Ultra-Low Latency)</option>
                     <option value="1920x1080_10">1920×1080 @ 10 FPS (Full HD)</option>
                 </select>
@@ -328,6 +348,26 @@ HTML_PAGE = """<!DOCTYPE html>
     </footer>
 
     <script>
+        let currentRotation = parseInt(localStorage.getItem('stream_rotation') || '0', 10);
+
+        function applyRotation() {
+            const img = document.getElementById('streamImg');
+            const rotLabel = document.getElementById('rotLabel');
+            if (rotLabel) rotLabel.innerText = currentRotation + '°';
+            
+            if (currentRotation === 90 || currentRotation === 270) {
+                img.style.transform = `rotate(${currentRotation}deg) scale(0.75)`;
+            } else {
+                img.style.transform = `rotate(${currentRotation}deg) scale(1)`;
+            }
+        }
+
+        function rotateCamera() {
+            currentRotation = (currentRotation + 90) % 360;
+            localStorage.setItem('stream_rotation', currentRotation);
+            applyRotation();
+        }
+
         function changeResolution(val) {
             fetch('/set_resolution?res=' + val)
                 .then(res => res.json())
@@ -342,6 +382,10 @@ HTML_PAGE = """<!DOCTYPE html>
             const img = document.getElementById('streamImg');
             img.src = '/stream.mjpg?t=' + new Date().getTime();
         }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            applyRotation();
+        });
     </script>
 </body>
 </html>

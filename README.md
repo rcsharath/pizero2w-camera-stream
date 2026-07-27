@@ -1,19 +1,19 @@
-# Raspberry Pi Zero 2W Camera Live View Stream Server 🎥
+# Raspberry Pi Zero 2W - Camera Stream Server & Edge Node 🤖
 
-A lightweight, zero-dependency HTTP MJPEG streaming server and web dashboard designed specifically for the **Raspberry Pi Zero 2W** (OV5647 5MP Camera).
+A lightweight, zero-dependency HTTP MJPEG streaming server and web dashboard designed for the **Raspberry Pi Zero 2W** (OV5647 5MP Camera).
 
-Offloads video scaling and frame encoding directly to the **Raspberry Pi VideoCore GPU hardware pipeline**, maintaining rock-solid 24/7 stream consistency with **0% added CPU overhead** during resolution switches.
 
----
 
 ## Key Features ✨
 
 - **Zero-Dependency Python HTTP Server:** Runs on standard Python 3 standard library (`http.server` & `socketserver`).
 - **GPU Hardware Resolution Switcher:** Supports dynamic GPU mode switching between:
-  - `640×480 @ 30 FPS` *(Smooth Motion - Recommended)*
+  - `1296×972 @ 15 FPS` *(Full Frame Native - Default)*
+  - `2592×1944 @ 10 FPS` *(Full Frame Max 5MP)*
   - `1280×720 @ 30 FPS` *(Smooth HD)*
-  - `640×480 @ 15 FPS` *(Balanced)*
   - `1280×720 @ 15 FPS` *(HD Detail)*
+  - `640×480 @ 30 FPS` *(Smooth Motion)*
+  - `640×480 @ 15 FPS` *(Balanced)*
   - `320×240 @ 30 FPS` *(Ultra-Low Latency)*
   - `1920×1080 @ 10 FPS` *(Full HD Stills)*
 - **Ultra-Low Memory Footprint:** Consumes only **~14.7 MB RAM** for Python and **~18 MB RAM** for the camera driver (~31 MB total), leaving >290 MB free RAM on Pi Zero 2W.
