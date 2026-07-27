@@ -515,6 +515,40 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- Hardware Crop (ROI) -->
+        <div class="panel-box">
+            <div class="panel-title">
+                ✂️ Hardware Crop (ROI)
+                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">GPU Hardware ISP</span>
+            </div>
+            <div class="slider-group">
+                <div class="slider-row">
+                    <label>Left Offset:</label>
+                    <input type="range" id="cropX" min="0" max="80" value="0" oninput="updateCropValues()">
+                    <span id="cropValX">0%</span>
+                </div>
+                <div class="slider-row">
+                    <label>Top Offset:</label>
+                    <input type="range" id="cropY" min="0" max="80" value="0" oninput="updateCropValues()">
+                    <span id="cropValY">0%</span>
+                </div>
+                <div class="slider-row">
+                    <label>Width:</label>
+                    <input type="range" id="cropW" min="20" max="100" value="100" oninput="updateCropValues()">
+                    <span id="cropValW">100%</span>
+                </div>
+                <div class="slider-row">
+                    <label>Height:</label>
+                    <input type="range" id="cropH" min="20" max="100" value="100" oninput="updateCropValues()">
+                    <span id="cropValH">100%</span>
+                </div>
+            </div>
+            <div class="btn-group">
+                <button class="btn" onclick="applyHardwareCrop()">✂️ Apply Hardware Crop</button>
+                <button class="btn btn-secondary" onclick="resetCrop()">🔄 Reset Full Frame</button>
+            </div>
+        </div>
+
         <!-- Color Balance Tuning -->
         <div class="panel-box">
             <div class="panel-title">
@@ -570,6 +604,46 @@ HTML_PAGE = """<!DOCTYPE html>
                 .then(data => {
                     const label = (mode === 'night_outdoor') ? '🌙 Outdoor Night Mode' : (mode === 'night_indoor' ? '💡 Indoor Dim Mode' : '☀️ Day / Standard');
                     document.getElementById('modeDisplay').innerText = label;
+                });
+        }
+
+        /* Hardware Crop (ROI) Functions */
+        function updateCropValues() {
+            const x = parseInt(document.getElementById('cropX').value);
+            const y = parseInt(document.getElementById('cropY').value);
+            const w = parseInt(document.getElementById('cropW').value);
+            const h = parseInt(document.getElementById('cropH').value);
+
+            document.getElementById('cropValX').innerText = x + '%';
+            document.getElementById('cropValY').innerText = y + '%';
+            document.getElementById('cropValW').innerText = w + '%';
+            document.getElementById('cropValH').innerText = h + '%';
+        }
+
+        function applyHardwareCrop() {
+            const x = (parseInt(document.getElementById('cropX').value) / 100.0).toFixed(2);
+            const y = (parseInt(document.getElementById('cropY').value) / 100.0).toFixed(2);
+            const w = (parseInt(document.getElementById('cropW').value) / 100.0).toFixed(2);
+            const h = (parseInt(document.getElementById('cropH').value) / 100.0).toFixed(2);
+
+            fetch(`/set_crop?x=${x}&y=${y}&w=${w}&h=${h}`)
+                .then(res => res.json())
+                .then(data => {
+                    console.log('Hardware Crop applied:', data);
+                });
+        }
+
+        function resetCrop() {
+            document.getElementById('cropX').value = 0;
+            document.getElementById('cropY').value = 0;
+            document.getElementById('cropW').value = 100;
+            document.getElementById('cropH').value = 100;
+            updateCropValues();
+
+            fetch('/set_crop?reset=1')
+                .then(res => res.json())
+                .then(data => {
+                    console.log('Crop reset:', data);
                 });
         }
 
