@@ -8,6 +8,8 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
 
 ## 🌟 Key Features
 
+- **🎛️ Independent Resolution & Frame Rate Controls:** Separate dropdowns for hardware resolutions ($1296\times 972$, $1920\times 1080$, $1280\times 720$, $640\times 480$, $320\times 240$) and customizable frame rate (5 to 30 FPS).
+- **🔄 1-Click Hardware 180° Orientation & Mirroring:** Hardware-accelerated 180° flip and mirror transforms (`/set_rotation`) with instant visual status feedback.
 - **🚀 Zero-Overhead Hardware H.264 Video Engine (Port 8888):** Hardware GPU stream server broadcasting over TCP (`tcp://rcsharathpi.local:8888`). Operates at **~2.7% CPU load** on Pi Zero 2W.
 - **🌙 Outdoor Night Mode & Exposure Presets:** One-click exposure and gain tuning for low-light outdoor surveillance (100ms long shutter, 6.0x analog gain boost, low-light AWB).
 - **✂️ Interactive Hardware Crop (ROI):** Dynamic hardware region-of-interest cropping (`--roi`) applied directly inside the VideoCore GPU ISP.
@@ -28,7 +30,7 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
 | Metric | Previous Software MJPEG | Hardware H.264 Engine | Improvement |
 | :--- | :--- | :--- | :--- |
 | **Pi CPU Usage** | **190%** (2 ARM cores maxed) | **~2.7%** | **~98.5% CPU Reduction** |
-| **Core Temperature** | **81.6°C** (Thermal Throttling) | **~48°C – 52°C** | **~31°C Cooler** |
+| **Core Temperature** | **81.6°C** (Thermal Throttling) | **~48°C – 60°C** | **~25°C Cooler** |
 | **24-Hour Recording Size** | ~28.8 GB | **~6.5 GB** | **75% Disk Savings** |
 | **Network Protocol** | HTTP MJPEG (`:8000`) | Hardware TCP H.264 (`:8888`) | Zero CPU encoding |
 
@@ -42,13 +44,14 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
    │                                                             │
    │   1. HTTP Control Server (Port 8000)                        │
    │      - System Telemetry (/stats)                            │
+   │      - Independent Resolution & FPS (/set_resolution, /set_fps)
    │      - Lighting Presets & Color Balance (/set_mode, /set_awb)│
-   │      - Hardware ROI Cropping (/set_crop)                    │
+   │      - Hardware Crop & Orientation (/set_crop, /set_rotation)│
    │      - On-demand 5MP Snapshots (/snapshot.jpg)              │
    │                                                             │
    │   2. Hardware H.264 Video Engine (Port 8888)                │
    │      - rpicam-vid --codec h264 (VideoCore GPU Hardware)     │
-   │      - Consumes ~2.7% CPU / Temp: ~48°C                     │
+   │      - Consumes ~2.7% CPU / Temp: ~55°C                     │
    └──────────────┬──────────────────────────────┬───────────────┘
                   │                              │
                   │ (Single H.264 TCP Stream)    │ (HTTP Control API)
@@ -94,7 +97,7 @@ loginctl enable-linger $USER
 ### 3. Windows Desktop Usage (Simultaneous Recording & Live Preview)
 * **1-Click Record & Live Preview (Recommended):** Double-click `record_and_preview.bat`. Launches FFmpeg stream recorder in background and opens VLC live preview instantly.
 * **Standalone Live Viewer:** Double-click `open_vlc_stream.bat`. Automatically uses host UDP relay if recording, or connects directly to Pi TCP stream if not recording.
-* **Web Management Dashboard:** Open `http://rcsharathpi.local:8000` in Chrome to tweak color balance, ROI crop, lighting presets, or system stats on the fly while recording.
+* **Web Management Dashboard:** Open `http://rcsharathpi.local:8000` in Chrome to tweak color balance, ROI crop, lighting presets, resolution, or frame rate on the fly while recording.
 
 ---
 
@@ -103,10 +106,12 @@ loginctl enable-linger $USER
 | Endpoint | Method | Parameters | Description |
 | :--- | :--- | :--- | :--- |
 | `/stats` | `GET` | None | Returns live JSON system telemetry (`temp`, `ram_free_mb`, `cpu_load`). |
+| `/set_resolution` | `GET` | `res=1296x972` | Changes hardware video encoding resolution ($1296\times 972$, $1920\times 1080$, $1280\times 720$, $640\times 480$, $320\times 240$). |
+| `/set_fps` | `GET` | `fps=15` | Configures video frame rate (5 to 30 FPS). |
+| `/set_rotation` | `GET` | `rot=0` / `180` / `hflip` / `vflip` | Configures hardware 180° rotation or mirror flip. |
 | `/set_mode` | `GET` | `mode=day` / `night_outdoor` / `night_indoor` | Configures shutter exposure & gain presets. |
 | `/set_crop` | `GET` | `x`, `y`, `w`, `h` (0.0 to 1.0) or `reset=1` | Applies hardware region-of-interest crop in VideoCore GPU. |
 | `/set_awb` | `GET` | `mode` (auto, indoor, etc.) & `red`, `blue` | Applies white balance & custom red/blue gain multipliers. |
-| `/set_resolution` | `GET` | `res=1296x972_15` | Changes resolution & FPS mode. |
 | `/snapshot.jpg` | `GET` | None | Captures and downloads a full 5MP (2592×1944) JPEG image. |
 
 ---

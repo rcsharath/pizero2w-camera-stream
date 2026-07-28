@@ -18,18 +18,18 @@ from socketserver import ThreadingMixIn
 PORT = 8000
 STREAM_TCP_PORT = 8888
 
-# Supported GPU hardware resolutions (Width, Height, FPS, Quality, Display Label)
+# Supported GPU hardware resolutions (Width, Height, Display Label)
 RESOLUTIONS = {
-    "1920x1080_15": (1920, 1080, 15, 45, "1920×1080 @ 15 FPS (Full HD Hardware H.264)"),
-    "1296x972_15": (1296, 972, 15, 45, "1296×972 @ 15 FPS (Full Frame Native H.264)"),
-    "2592x1944_10": (2592, 1944, 10, 40, "2592×1944 @ 10 FPS (Full Frame Max 5MP H.264)"),
-    "1280x720_30": (1280, 720, 30, 40, "1280×720 @ 30 FPS (Smooth HD)"),
-    "640x480_30": (640, 480, 30, 45, "640×480 @ 30 FPS (Smooth Motion)"),
-    "320x240_30": (320, 240, 30, 60, "320×240 @ 30 FPS (Ultra-Low Latency)")
+    "1920x1080": (1920, 1080, "1920×1080 (Full HD 16:9)"),
+    "1296x972": (1296, 972, "1296×972 (Full Frame Native 4:3)"),
+    "1280x720": (1280, 720, "1280×720 (Smooth HD 16:9)"),
+    "640x480": (640, 480, "640×480 (Smooth Motion 4:3)"),
+    "320x240": (320, 240, "320×240 (Ultra-Low Latency 4:3)")
 }
 
-current_res_key = "1296x972_15"
-current_width, current_height, current_fps, current_quality, _ = RESOLUTIONS[current_res_key]
+current_res_key = "1296x972"
+current_width, current_height, _ = RESOLUTIONS[current_res_key]
+current_fps = 15
 
 # Hardware ROI, AWB & Mode State
 current_roi = None  # None or string "x,y,w,h" (normalized 0.0 to 1.0)
@@ -80,7 +80,7 @@ def camera_worker():
     
     while True:
         with camera_lock:
-            w, h, fps, q = current_width, current_height, current_fps, current_quality
+            w, h, fps = current_width, current_height, current_fps
             roi = current_roi
             mode = current_mode
             awb = current_awb
@@ -481,7 +481,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="stream-info-banner">
             <div class="banner-row">
                 <strong style="color: var(--accent-color);">🚀 Hardware H.264 Video Engine Output (Port 8888)</strong>
-                <span style="font-size: 0.75rem; color: var(--success-color);">Ice-Cold (~48°C / 2% CPU)</span>
+                <span style="font-size: 0.75rem; color: var(--success-color);">⚡ Low Overhead H.264 Hardware Stream</span>
             </div>
             <div class="code-box">
                 VLC / OBS Stream URL: <strong>tcp/h264://rcsharathpi.local:8888</strong>
@@ -493,16 +493,26 @@ HTML_PAGE = """<!DOCTYPE html>
 
         <div class="controls-bar">
             <div class="info-group">
-                <label for="resSelect">Resolution & FPS:</label>
+                <label for="resSelect">Resolution:</label>
                 <select id="resSelect" onchange="changeResolution(this.value)">
-                    <option value="1296x972_15">1296×972 @ 15 FPS (Full Frame Native H.264)</option>
-                    <option value="1920x1080_15">1920×1080 @ 15 FPS (Full HD Hardware H.264)</option>
-                    <option value="2592x1944_10">2592×1944 @ 10 FPS (Full Frame Max 5MP H.264)</option>
-                    <option value="1280x720_30">1280×720 @ 30 FPS (Smooth HD)</option>
-                    <option value="640x480_30">640×480 @ 30 FPS (Smooth Motion)</option>
-                    <option value="320x240_30">320×240 @ 30 FPS (Ultra-Low Latency)</option>
+                    <option value="1296x972" selected>1296×972 (Full Frame Native 4:3)</option>
+                    <option value="1920x1080">1920×1080 (Full HD 16:9)</option>
+                    <option value="1280x720">1280×720 (Smooth HD 16:9)</option>
+                    <option value="640x480">640×480 (Smooth Motion 4:3)</option>
+                    <option value="320x240">320×240 (Ultra-Low Latency 4:3)</option>
                 </select>
-                <div class="info-item">Current Mode: <span id="modeDisplay" style="color:var(--accent-color); font-weight:600;">Day / Auto</span></div>
+
+                <label for="fpsSelect" style="margin-left: 1rem;">Frame Rate:</label>
+                <select id="fpsSelect" onchange="changeFPS(this.value)">
+                    <option value="5">5 FPS</option>
+                    <option value="10">10 FPS</option>
+                    <option value="15" selected>15 FPS</option>
+                    <option value="20">20 FPS</option>
+                    <option value="25">25 FPS</option>
+                    <option value="30">30 FPS</option>
+                </select>
+
+                <div class="info-item" style="margin-left: auto;">Current Mode: <span id="modeDisplay" style="color:var(--accent-color); font-weight:600;">Day / Auto</span></div>
             </div>
         </div>
     </div>
@@ -601,19 +611,19 @@ HTML_PAGE = """<!DOCTYPE html>
                 <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">0% CPU Hardware ISP</span>
             </div>
             <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-                Apply native camera sensor hardware orientation & mirror transforms:
+                Click button to invert stream orientation 180° or apply mirror flips in hardware:
             </div>
             <div class="btn-group" style="flex-wrap: wrap;">
-                <button class="btn" id="rotBtn0" onclick="setHardwareRotation('0')">📱 0° (Normal)</button>
-                <button class="btn btn-secondary" id="rotBtn180" onclick="setHardwareRotation('180')">🙃 180° (Inverted)</button>
-                <button class="btn btn-secondary" id="rotBtnHflip" onclick="setHardwareRotation('hflip')">↔️ Horizontal Flip</button>
-                <button class="btn btn-secondary" id="rotBtnVflip" onclick="setHardwareRotation('vflip')">↕️ Vertical Flip</button>
+                <button class="btn" id="rotateToggleBtn" onclick="toggle180Rotation()">🔄 Rotate to 180° (Inverted)</button>
+                <button class="btn btn-secondary" id="rotBtnHflip" onclick="setHardwareRotation('hflip')">↔️ Mirror Horizontal</button>
+                <button class="btn btn-secondary" id="rotBtnVflip" onclick="setHardwareRotation('vflip')">↕️ Mirror Vertical</button>
             </div>
             <div style="margin-top: 0.75rem; font-size: 0.8rem; color: var(--text-muted);">
                 Active Mode: <strong id="activeRotLabel" style="color: var(--accent-color);">0° (Normal)</strong>
+                <span id="rotStatusToast" style="margin-left: 0.5rem; font-size: 0.75rem; color: var(--success-color); display: none;">✓ Applied</span>
             </div>
             <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #94a3b8; background-color: #0f172a; padding: 0.4rem 0.6rem; border-radius: 4px;">
-                💡 <em>Note: 0°, 180°, and Mirror flips execute in camera hardware (0% CPU). For 90°/270° portrait rotation, use VLC Video Effects (Geometry) on host PC.</em>
+                💡 <em>Note: 0°, 180°, and Mirror flips execute in camera hardware (0% CPU). 90°/270° transpose is unsupported by OV5647 hardware ISP; for 90° portrait rotation, use VLC Video Effects (Geometry) on host PC.</em>
             </div>
         </div>
     </div>
@@ -631,33 +641,63 @@ HTML_PAGE = """<!DOCTYPE html>
                 });
         }
 
+        function changeFPS(val) {
+            fetch('/set_fps?fps=' + val)
+                .then(res => res.json())
+                .then(data => {
+                    console.log('FPS set:', data);
+                });
+        }
+
+        let currentRotationState = '0';
+
+        function toggle180Rotation() {
+            const nextRot = (currentRotationState === '180') ? '0' : '180';
+            setHardwareRotation(nextRot);
+        }
+
         function setHardwareRotation(rot) {
+            const toast = document.getElementById('rotStatusToast');
+            if (toast) {
+                toast.style.display = 'inline';
+                toast.innerText = 'Applying...';
+            }
             fetch('/set_rotation?rot=' + rot)
                 .then(res => res.json())
                 .then(data => {
+                    currentRotationState = data.rotation;
                     updateRotationUI(data.rotation);
+                    if (toast) {
+                        toast.innerText = '✓ Applied';
+                        setTimeout(() => { toast.style.display = 'none'; }, 2000);
+                    }
                     console.log('Hardware rotation applied:', data);
                 });
         }
 
         function updateRotationUI(rot) {
             const rotStr = String(rot);
-            ['0', '180', 'hflip', 'vflip'].forEach(r => {
-                const btnId = r === 'hflip' ? 'rotBtnHflip' : (r === 'vflip' ? 'rotBtnVflip' : 'rotBtn' + r);
+            currentRotationState = rotStr;
+            const toggleBtn = document.getElementById('rotateToggleBtn');
+            if (toggleBtn) {
+                if (rotStr === '180') {
+                    toggleBtn.innerText = '🔄 Rotate to 0° (Normal)';
+                    toggleBtn.className = 'btn';
+                } else {
+                    toggleBtn.innerText = '🔄 Rotate to 180° (Inverted)';
+                    toggleBtn.className = (rotStr === '0') ? 'btn' : 'btn btn-secondary';
+                }
+            }
+            ['hflip', 'vflip'].forEach(r => {
+                const btnId = r === 'hflip' ? 'rotBtnHflip' : 'rotBtnVflip';
                 const btn = document.getElementById(btnId);
                 if (btn) {
-                    if (r === rotStr) {
-                        btn.classList.remove('btn-secondary');
-                        btn.classList.add('btn');
-                    } else {
-                        btn.classList.remove('btn');
-                        btn.classList.add('btn-secondary');
-                    }
+                    btn.className = (r === rotStr) ? 'btn' : 'btn btn-secondary';
                 }
             });
             const label = document.getElementById('activeRotLabel');
             if (label) {
-                const names = {'0': '0° (Normal)', '180': '180° (Inverted)', 'hflip': 'Horizontal Flip', 'vflip': 'Vertical Flip'};
+                const names = {'0': '0° (Normal)', '180': '180° (Inverted)', 'hflip': 'Horizontal Mirror', 'vflip': 'Vertical Mirror'};
                 label.innerText = names[rotStr] || rotStr;
             }
         }
@@ -800,17 +840,33 @@ class StreamHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == '/set_resolution':
             query = parse_qs(parsed.query)
-            res = query.get('res', ['1296x972_15'])[0]
+            res = query.get('res', ['1296x972'])[0]
 
             if res in RESOLUTIONS and res != current_res_key:
                 current_res_key = res
-                current_width, current_height, current_fps, current_quality, _ = RESOLUTIONS[res]
+                current_width, current_height, _ = RESOLUTIONS[res]
                 restart_requested = True
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             resp = f'{{"status":"ok","res":"{current_res_key}","width":{current_width},"height":{current_height},"fps":{current_fps}}}'
+            self.wfile.write(resp.encode('utf-8'))
+
+        elif parsed.path == '/set_fps':
+            query = parse_qs(parsed.query)
+            try:
+                fps_val = int(query.get('fps', [15])[0])
+                if 5 <= fps_val <= 30 and fps_val != current_fps:
+                    current_fps = fps_val
+                    restart_requested = True
+            except (ValueError, IndexError):
+                pass
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            resp = f'{{"status":"ok","fps":{current_fps}}}'
             self.wfile.write(resp.encode('utf-8'))
 
         elif parsed.path == '/set_mode':
