@@ -129,6 +129,62 @@ class TestObservability(unittest.TestCase):
         self.assertEqual(events[1]["ev"], "http.request")
         self.assertEqual(events[1]["seq"], req_seq)
 
+    def test_camera_worker_writes_module_level_gen_start_time(self):
+        # Regression test for a real bug: camera_worker() previously assigned
+        # `gen_start_time = time.monotonic()` without declaring it in the
+        # function's `global` statement. That makes it a function-local
+        # variable that shadows the module global of the same name, so the
+        # module-level stream_server.gen_start_time (which reconciler_worker
+        # reads) was NEVER updated and stayed None forever. The reconciler's
+        # `gen_start_t is not None` gate was then permanently False, silently
+        # disabling the argv drift check entirely. This test drives the real
+        # camera_worker() launch path (not a hand-copied gating expression)
+        # and asserts the module attribute itself changes.
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_proc.poll.return_value = None
+        mock_proc.stderr = None  # drain_stderr() returns immediately
+
+        class _StopWorker(Exception):
+            pass
+
+        def _fake_sleep(_seconds):
+            # camera_worker()'s first time.sleep() call happens inside the
+            # inner poll loop, right after Popen + camera.launched are done.
+            # Bail out there so this stays a single-iteration test.
+            raise _StopWorker()
+
+        with stream_server.camera_lock:
+            stream_server.camera_process = None
+            stream_server.gen_start_time = None
+            saved_restart_requested = stream_server.restart_requested
+            stream_server.restart_requested = False
+
+        before = time.monotonic()
+        try:
+            with patch('subprocess.Popen', return_value=mock_proc), \
+                 patch('time.sleep', side_effect=_fake_sleep), \
+                 patch('sys.stdout', self.stdout_capture):
+                try:
+                    stream_server.camera_worker()
+                except _StopWorker:
+                    pass
+
+            with stream_server.camera_lock:
+                recorded = stream_server.gen_start_time
+        finally:
+            with stream_server.camera_lock:
+                stream_server.camera_process = None
+                stream_server.gen_start_time = None
+                stream_server.restart_requested = saved_restart_requested
+
+        self.assertIsNotNone(
+            recorded,
+            "camera_worker() must update the MODULE-LEVEL gen_start_time "
+            "(missing `global gen_start_time` will fail this)"
+        )
+        self.assertGreaterEqual(recorded, before)
+
     def test_reconciler_gen_start_time_gating(self):
         # Verify gen_start_time gating behavior: if generation age <= 5.0s, argv drift check is suppressed
         mock_proc = MagicMock()

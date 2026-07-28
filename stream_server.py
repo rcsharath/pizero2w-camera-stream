@@ -497,7 +497,7 @@ def drain_stderr(proc, gen: int, pid: int):
 
 
 def camera_worker():
-    global camera_process, restart_requested, current_gen, last_launched_argv, current_cause_seq, exit_timestamps
+    global camera_process, restart_requested, current_gen, last_launched_argv, current_cause_seq, exit_timestamps, gen_start_time
 
     while True:
         with camera_lock:

@@ -12,9 +12,9 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
 - **🔄 1-Click Hardware 180° Orientation & Mirroring:** Hardware-accelerated 180° flip and mirror transforms (`/set_rotation`) with instant visual status feedback.
 - **🚀 Zero-Overhead Hardware H.264 Video Engine (Port 8888):** Hardware GPU stream server broadcasting over TCP (`tcp://rcsharathpi.local:8888`). Operates at **~2.7% CPU load** on Pi Zero 2W.
 - **🌙 Outdoor Night Mode & Exposure Presets:** One-click exposure and gain tuning for low-light outdoor surveillance (100ms long shutter, 6.0x analog gain boost, low-light AWB).
-- **✂️ Interactive Hardware Crop (ROI):** Dynamic hardware region-of-interest cropping (`--roi`) applied directly inside the VideoCore GPU ISP.
+- **✂️ Interactive Hardware Crop (ROI):** Aspect-ratio aware hardware region-of-interest cropping (`--roi`) scaled to OV5647 4:3 native sensor geometry with automatic aspect preservation and offset clamping.
 - **🎨 Color Balance & White Balance Tuning:** Hardware ISP AWB presets (Indoor, Incandescent, Tungsten) and custom Red/Blue gain multipliers (`--awbgains`).
-- **📊 Real-Time System Telemetry:** Header metrics badges polling directly from procfs with zero overhead (`/stats` — CPU Temp °C, Free RAM MB, System Load).
+- **📊 Structured JSON Telemetry & Health Reconciler:** Emits structured single-line JSON observability events (`system.sample`, `health.tick`, `camera.launched`, `http.request`, `http.rejected`) with 10s reconciler drift monitoring and 40 automated unit tests (`python -m unittest discover -s tests`).
 - **🎬 1-Click Windows Desktop Launchers:**
   - `record_and_preview.bat` — **Primary Entry Point:** Simultaneously records H.264 video into timestamped `.mp4` chunks AND launches live low-latency preview in VLC via PC-side UDP relay.
   - `open_vlc_stream.bat` — Smart viewer script that connects to host UDP relay when recording, or falls back to direct Pi TCP stream when standalone.
