@@ -64,6 +64,17 @@ camera_process = None
 restart_requested = False
 camera_lock = threading.RLock()
 
+# Snapshot/stream mutual exclusion (C5 fix). rpicam-vid and rpicam-still cannot hold
+# the sensor at the same time. snapshot_lock is a single-flight, non-blocking gate:
+# a second concurrent /snapshot.jpg request gets HTTP 409 instead of piling up a hung
+# thread and a zombie rpicam-still process. stream_paused tells camera_worker to hold
+# off relaunching rpicam-vid while a snapshot is being captured; stream_pause_cond lets
+# the worker sleep instead of busy-polling, and wakes it the instant the snapshot handler
+# clears the flag.
+snapshot_lock = threading.Lock()
+stream_paused = False
+stream_pause_cond = threading.Condition(camera_lock)
+
 # Observability Globals
 RUN_ID = uuid.uuid4().hex[:6]
 seq_lock = threading.Lock()
@@ -201,6 +212,44 @@ def validate_roi(x_val, y_val, w_val, h_val):
         raise ValueError(f"Invalid ROI y='{y_val}' and h='{h_val}'; y + h ({y+h}) exceeds 1.0")
 
     return f"{x},{y},{w},{h}"
+
+
+SENSOR_ASPECT = 2592 / 1944  # OV5647 native 4:3 sensor. --roi fractions are always
+                              # relative to this full sensor field of view, regardless
+                              # of the currently selected output resolution.
+
+
+def correct_roi_aspect(roi_str, out_width, out_height):
+    """
+    Recomputes the ROI's height fraction so the cropped sensor rectangle's pixel
+    aspect ratio matches the given output resolution, holding the width fraction
+    and x/y offsets fixed. Returns roi_str unchanged if it is None or malformed.
+
+    This is the single server-side authority for ROI correctness. It must run on
+    every path that can set or load a resolution/ROI pair (set_crop, set_resolution,
+    load_state) so a mismatched crop can never persist regardless of which client,
+    or none, produced the change. The dashboard's own JS does the same calculation
+    for instant slider feedback, but that is a UX nicety now, not the source of truth.
+    """
+    if roi_str is None:
+        return None
+    parts = roi_str.split(",")
+    if len(parts) != 4:
+        return roi_str
+    try:
+        x, y, w, h = (float(p) for p in parts)
+    except ValueError:
+        return roi_str
+    if out_width <= 0 or out_height <= 0 or w <= 0:
+        return roi_str
+
+    target_ratio = (out_width / out_height) / SENSOR_ASPECT
+    new_h = w / target_ratio
+    new_h = max(0.05, min(1.0, new_h))
+    if y + new_h > 1.0 + 1e-9:
+        new_h = max(0.05, 1.0 - y)
+
+    return f"{x},{y},{w},{new_h}"
 
 
 def current_state_dict():
@@ -405,6 +454,18 @@ def load_state():
             rejected.append("rotation")
             emit("state.key_rejected", lvl="warn", key="rotation", value=data.get("rotation"), reason=str(e))
 
+    # Self-heal: a crop persisted under one resolution (or hand-edited, or written
+    # before this correction existed) can be aspect-mismatched against whatever
+    # resolution just loaded. Fix it here so a stale state.json can never produce
+    # a stretched picture, and persist the correction so it doesn't repeat on
+    # every subsequent boot.
+    if current_roi is not None:
+        corrected_roi = correct_roi_aspect(current_roi, current_width, current_height)
+        if corrected_roi != current_roi:
+            emit("state.key_corrected", lvl="warn", key="roi", **{"from": current_roi, "to": corrected_roi}, reason="aspect_mismatch_with_resolution")
+            current_roi = corrected_roi
+            save_state()
+
     emit("state.loaded", lvl="info", path=path, accepted=accepted, rejected=rejected)
 
 
@@ -500,6 +561,10 @@ def camera_worker():
     global camera_process, restart_requested, current_gen, last_launched_argv, current_cause_seq, exit_timestamps, gen_start_time
 
     while True:
+        with stream_pause_cond:
+            while stream_paused:
+                stream_pause_cond.wait()
+
         with camera_lock:
             res_w, res_h = current_width, current_height
             fps = current_fps
@@ -777,7 +842,15 @@ class StreamHandler(BaseHTTPRequestHandler):
                 res_val = query.get('res', [''])[0]
                 try:
                     res = validate_res(res_val)
-                    if apply_change("resolution", res, cause_seq=req_seq):
+                    res_changed = apply_change("resolution", res, cause_seq=req_seq)
+                    roi_changed = False
+                    if res_changed:
+                        with camera_lock:
+                            w_now, h_now, roi_now = current_width, current_height, current_roi
+                        corrected_roi = correct_roi_aspect(roi_now, w_now, h_now)
+                        if corrected_roi != roi_now:
+                            roi_changed = apply_change("roi", corrected_roi, cause_seq=req_seq)
+                    if res_changed or roi_changed:
                         request_restart(cause_seq=req_seq, reason="state_changed:resolution")
                     with camera_lock:
                         state = current_state_dict()
@@ -837,6 +910,8 @@ class StreamHandler(BaseHTTPRequestHandler):
                         changed = apply_change("roi", None, cause_seq=req_seq)
                     elif 'x' in query and 'y' in query and 'w' in query and 'h' in query:
                         roi_str = validate_roi(query['x'][0], query['y'][0], query['w'][0], query['h'][0])
+                        with camera_lock:
+                            roi_str = correct_roi_aspect(roi_str, current_width, current_height)
                         changed = apply_change("roi", roi_str, cause_seq=req_seq)
                     else:
                         raise ValueError("Missing ROI parameters x, y, w, h or reset")
@@ -903,37 +978,101 @@ class StreamHandler(BaseHTTPRequestHandler):
                 emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
             elif parsed.path == '/snapshot.jpg':
-                with camera_lock:
-                    rot_str = str(current_rotation)
-                snap_seq = emit("snapshot.requested", lvl="info", cause=req_seq, rotation=rot_str)
-                snap_t = time.monotonic()
+                global stream_paused
+
+                # Single-flight gate: a second concurrent snapshot request gets 409
+                # immediately, not a hung thread waiting behind the first one.
+                got_lock = snapshot_lock.acquire(blocking=False)
+                if not got_lock:
+                    emit("snapshot.busy", lvl="warn", cause=req_seq)
+                    self._send_error("Snapshot already in progress", status=409, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=409, dur_ms=dur_ms)
+                    return
+
                 try:
-                    cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
-                    if rot_str == "180":
-                        cmd.extend(["--rotation", "180"])
-                    elif rot_str == "hflip":
-                        cmd.extend(["--hflip"])
-                    elif rot_str == "vflip":
-                        cmd.extend(["--vflip"])
+                    with camera_lock:
+                        rot_str = str(current_rotation)
+                        proc_to_stop = camera_process
+                        stream_paused = True
 
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout_data, stderr_data = proc.communicate()
-                    snap_dur = int((time.monotonic() - snap_t) * 1000)
+                    snap_seq = emit("snapshot.requested", lvl="info", cause=req_seq, rotation=rot_str)
+                    snap_t = time.monotonic()
 
-                    if proc.returncode == 0:
-                        emit("snapshot.ok", lvl="info", cause=snap_seq, bytes=len(stdout_data), dur_ms=snap_dur)
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'image/jpeg')
-                        self.send_header('Content-Length', str(len(stdout_data)))
-                        self.end_headers()
-                        if not is_head:
-                            self.wfile.write(stdout_data)
-                        dur_ms = int((time.monotonic() - start_t) * 1000)
-                        emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
+                    # Pause: release the sensor by tearing down rpicam-vid. request_restart()
+                    # wakes camera_worker's inner loop; stream_paused (set above) keeps the
+                    # worker from relaunching until this handler clears it in `finally`.
+                    if proc_to_stop is not None and proc_to_stop.poll() is None:
+                        request_restart(cause_seq=snap_seq, reason="snapshot_pause")
+
+                    release_deadline = time.monotonic() + 5.0
+                    while time.monotonic() < release_deadline:
+                        with camera_lock:
+                            still_holding_sensor = camera_process is not None and camera_process.poll() is None
+                        if not still_holding_sensor:
+                            break
+                        time.sleep(0.1)
                     else:
-                        err_text = stderr_data.decode('utf-8', errors='replace')[:2048]
-                        emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=proc.returncode, stderr=err_text, dur_ms=snap_dur)
-                        err_msg = f"Snapshot failed: {err_text}".encode('utf-8')
+                        emit("snapshot.pause_timeout", lvl="warn", cause=snap_seq)
+
+                    try:
+                        cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
+                        if rot_str == "180":
+                            cmd.extend(["--rotation", "180"])
+                        elif rot_str == "hflip":
+                            cmd.extend(["--hflip"])
+                        elif rot_str == "vflip":
+                            cmd.extend(["--vflip"])
+
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        try:
+                            stdout_data, stderr_data = proc.communicate(timeout=20)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            stdout_data, stderr_data = proc.communicate()
+                            snap_dur = int((time.monotonic() - snap_t) * 1000)
+                            err_text = (stderr_data.decode('utf-8', errors='replace')[:2048]
+                                        if stderr_data else "rpicam-still timed out after 20s")
+                            emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=-9, stderr=err_text, dur_ms=snap_dur, reason="timeout")
+                            err_msg = f"Snapshot timed out: {err_text}".encode('utf-8')
+                            self.send_response(504)
+                            self.send_header('Content-Type', 'text/plain')
+                            self.send_header('Content-Length', str(len(err_msg)))
+                            self.end_headers()
+                            if not is_head:
+                                self.wfile.write(err_msg)
+                            dur_ms = int((time.monotonic() - start_t) * 1000)
+                            emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=504, dur_ms=dur_ms)
+                            return
+
+                        snap_dur = int((time.monotonic() - snap_t) * 1000)
+
+                        if proc.returncode == 0:
+                            emit("snapshot.ok", lvl="info", cause=snap_seq, bytes=len(stdout_data), dur_ms=snap_dur)
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'image/jpeg')
+                            self.send_header('Content-Length', str(len(stdout_data)))
+                            self.end_headers()
+                            if not is_head:
+                                self.wfile.write(stdout_data)
+                            dur_ms = int((time.monotonic() - start_t) * 1000)
+                            emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
+                        else:
+                            err_text = stderr_data.decode('utf-8', errors='replace')[:2048]
+                            emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=proc.returncode, stderr=err_text, dur_ms=snap_dur)
+                            err_msg = f"Snapshot failed: {err_text}".encode('utf-8')
+                            self.send_response(500)
+                            self.send_header('Content-Type', 'text/plain')
+                            self.send_header('Content-Length', str(len(err_msg)))
+                            self.end_headers()
+                            if not is_head:
+                                self.wfile.write(err_msg)
+                            dur_ms = int((time.monotonic() - start_t) * 1000)
+                            emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=500, dur_ms=dur_ms)
+                    except Exception as e:
+                        snap_dur = int((time.monotonic() - snap_t) * 1000)
+                        emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=-1, stderr=str(e), dur_ms=snap_dur)
+                        err_msg = f"Snapshot failed: {e}".encode('utf-8')
                         self.send_response(500)
                         self.send_header('Content-Type', 'text/plain')
                         self.send_header('Content-Length', str(len(err_msg)))
@@ -942,18 +1081,15 @@ class StreamHandler(BaseHTTPRequestHandler):
                             self.wfile.write(err_msg)
                         dur_ms = int((time.monotonic() - start_t) * 1000)
                         emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=500, dur_ms=dur_ms)
-                except Exception as e:
-                    snap_dur = int((time.monotonic() - snap_t) * 1000)
-                    emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=-1, stderr=str(e), dur_ms=snap_dur)
-                    err_msg = f"Snapshot failed: {e}".encode('utf-8')
-                    self.send_response(500)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.send_header('Content-Length', str(len(err_msg)))
-                    self.end_headers()
-                    if not is_head:
-                        self.wfile.write(err_msg)
-                    dur_ms = int((time.monotonic() - start_t) * 1000)
-                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=500, dur_ms=dur_ms)
+                finally:
+                    # Resume: clear the pause flag and wake camera_worker so it relaunches
+                    # rpicam-vid with whatever config is currently live. This always runs,
+                    # even on timeout/exception, so a failed snapshot can never leave the
+                    # stream paused indefinitely.
+                    with stream_pause_cond:
+                        stream_paused = False
+                        stream_pause_cond.notify_all()
+                    snapshot_lock.release()
 
             else:
                 self.send_response(404)
