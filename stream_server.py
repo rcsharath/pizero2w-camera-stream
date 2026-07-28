@@ -2,13 +2,20 @@
 """
 Lightweight Hybrid H.264 & HTTP Management Server for Raspberry Pi Zero 2W
 Optimized for 0% CPU Hardware H.264 video encoding over TCP (port 8888),
-with Outdoor Night Mode presets, interactive cropping, color tuning, and system telemetry dashboard.
+with Outdoor Night Mode presets, interactive cropping, color tuning, system telemetry dashboard,
+and zero-overhead structured JSON observability.
 """
 
 import os
 import sys
 import time
 import json
+import uuid
+import signal
+import atexit
+import datetime
+import hashlib
+import traceback
 import subprocess
 import threading
 from urllib.parse import parse_qs, urlparse
@@ -27,11 +34,7 @@ RESOLUTIONS = {
     "320x240": (320, 240, "320×240 (Ultra-Low Latency 4:3)")
 }
 
-# Per-resolution fps ceilings. 640x480, 1296x972, and 1920x1080 come from the
-# documented OV5647 sensor mode table in Hardware.md, floored to int. 1280x720
-# and 320x240 are software-scaled outputs with no documented native fps; they
-# keep the previous flat 30 cap until verified on real hardware. Do not raise
-# 1280x720 or 320x240 without an on-device check first.
+# Per-resolution fps ceilings.
 FPS_LIMITS = {
     "1920x1080": 32,
     "1296x972": 46,
@@ -54,12 +57,77 @@ current_mode = "day"  # day, night_outdoor, night_indoor
 current_awb = "auto"  # auto, indoor, incandescent, tungsten, custom
 current_red_gain = 1.70
 current_blue_gain = 1.40
-current_rotation = "0"  # "0", "180", "hflip", "vflip" (hardware ISP sensor transforms)
+current_rotation = "0"  # "0", "180", "hflip", "vflip"
 
-# Global state
+# Global process & camera state (Reentrant lock prevents handler deadlocks)
 camera_process = None
 restart_requested = False
-camera_lock = threading.Lock()
+camera_lock = threading.RLock()
+
+# Observability Globals
+RUN_ID = uuid.uuid4().hex[:6]
+seq_lock = threading.Lock()
+current_seq = 0
+current_gen = 0
+current_cause_seq = None
+last_launched_argv = []
+exit_timestamps = []
+camera_thread = None
+reconciler_thread = None
+
+
+def reserve_seq() -> int:
+    """Reserves sequence number atomically for start of async operations."""
+    global current_seq
+    with seq_lock:
+        current_seq += 1
+        return current_seq
+
+
+def emit(ev: str, lvl: str = "info", cause: int = None, gen: int = None, seq: int = None, **kwargs) -> int:
+    """
+    Emits a single-line JSON structured event to stdout.
+    Exception-safe with fallback handling. Writes atomically under seq_lock to preserve line ordering.
+    """
+    global current_seq
+    with seq_lock:
+        if seq is None:
+            current_seq += 1
+            seq_num = current_seq
+        else:
+            seq_num = seq
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        mono_val = round(time.monotonic(), 3)
+
+        payload = {
+            "ts": ts_str,
+            "mono": mono_val,
+            "run": RUN_ID,
+            "seq": seq_num,
+            "lvl": lvl,
+            "ev": ev
+        }
+
+        if cause is not None:
+            payload["cause"] = cause
+        if gen is not None:
+            payload["gen"] = gen
+
+        payload.update(kwargs)
+
+        try:
+            json_str = json.dumps(payload, separators=(',', ':'), default=str)
+        except Exception as e:
+            json_str = json.dumps({
+                "ts": ts_str, "mono": mono_val, "run": RUN_ID, "seq": seq_num,
+                "lvl": "error", "ev": "log.emit_failed", "orig_ev": ev, "error": str(e)
+            }, separators=(',', ':'))
+
+        sys.stdout.write(json_str + "\n")
+        sys.stdout.flush()
+        return seq_num
 
 
 def validate_res(res_val):
@@ -161,8 +229,8 @@ def get_state_file_path():
 
 
 def save_state():
+    path = get_state_file_path()
     try:
-        path = get_state_file_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {
             "resolution": current_res_key,
@@ -177,7 +245,60 @@ def save_state():
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"[State] Error saving state: {e}")
+        emit("state.save_failed", lvl="error", path=path, error=str(e))
+
+
+def request_restart(cause_seq=None, reason="config_change"):
+    global restart_requested, current_cause_seq
+    restart_requested = True
+    if cause_seq is not None:
+        current_cause_seq = cause_seq
+    emit("camera.restart_requested", lvl="info", cause=cause_seq, gen=current_gen, reason=reason)
+
+
+def apply_change(field_name: str, new_value, cause_seq: int = None) -> bool:
+    """
+    Applies state change under camera_lock, emits state.changed or state.unchanged,
+    and saves state to disk. Caller is responsible for triggering request_restart().
+    Returns True if changed, False otherwise.
+    """
+    global current_res_key, current_width, current_height, current_fps
+    global current_mode, current_awb, current_red_gain, current_blue_gain, current_roi, current_rotation
+
+    with camera_lock:
+        if field_name == "resolution":
+            old_val = current_res_key
+        else:
+            old_val = globals().get(f"current_{field_name}")
+
+        if old_val == new_value:
+            emit("state.unchanged", lvl="info", cause=cause_seq, field=field_name, value=new_value)
+            return False
+
+        if field_name == "resolution":
+            current_res_key = new_value
+            current_width, current_height, _ = RESOLUTIONS[new_value]
+            cap = FPS_LIMITS.get(current_res_key, 30)
+            if current_fps > cap:
+                current_fps = cap
+        elif field_name == "fps":
+            current_fps = new_value
+        elif field_name == "mode":
+            current_mode = new_value
+        elif field_name == "awb":
+            current_awb = new_value
+        elif field_name == "red_gain":
+            current_red_gain = new_value
+        elif field_name == "blue_gain":
+            current_blue_gain = new_value
+        elif field_name == "roi":
+            current_roi = new_value
+        elif field_name == "rotation":
+            current_rotation = new_value
+
+        save_state()
+        emit("state.changed", lvl="info", cause=cause_seq, field=field_name, **{"from": old_val, "to": new_value})
+        return True
 
 
 def load_state():
@@ -186,82 +307,126 @@ def load_state():
 
     path = get_state_file_path()
     if not os.path.exists(path):
-        print(f"[State] State file absent at {path}; using default state")
+        emit("state.loaded", lvl="info", path=path, accepted=[], rejected=["absent"])
         return
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"[State] Failed to read/parse state file at {path} ({e}); using default state")
+        emit("state.loaded", lvl="warn", path=path, error=str(e))
         return
 
     if not isinstance(data, dict):
-        print(f"[State] State file contents at {path} are not a JSON object; using default state")
+        emit("state.loaded", lvl="warn", path=path, error="Not a JSON object")
         return
+
+    accepted = []
+    rejected = []
 
     if "resolution" in data:
         try:
             res_val = validate_res(data["resolution"])
             current_res_key = res_val
             current_width, current_height, _ = RESOLUTIONS[current_res_key]
+            accepted.append("resolution")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'resolution' key: {e}")
+            rejected.append("resolution")
+            emit("state.key_rejected", lvl="warn", key="resolution", value=data.get("resolution"), reason=str(e))
 
     if "fps" in data:
         try:
             current_fps = validate_fps(data["fps"], current_res_key)
+            accepted.append("fps")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'fps' key: {e}")
+            rejected.append("fps")
+            emit("state.key_rejected", lvl="warn", key="fps", value=data.get("fps"), reason=str(e))
 
     if "mode" in data:
         try:
             current_mode = validate_mode(data["mode"])
+            accepted.append("mode")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'mode' key: {e}")
+            rejected.append("mode")
+            emit("state.key_rejected", lvl="warn", key="mode", value=data.get("mode"), reason=str(e))
 
     if "awb" in data:
         try:
             current_awb = validate_awb(data["awb"])
+            accepted.append("awb")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'awb' key: {e}")
+            rejected.append("awb")
+            emit("state.key_rejected", lvl="warn", key="awb", value=data.get("awb"), reason=str(e))
 
     if "red_gain" in data:
         try:
             current_red_gain = clamp_gain(data["red_gain"], "red_gain")
+            accepted.append("red_gain")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'red_gain' key: {e}")
+            rejected.append("red_gain")
+            emit("state.key_rejected", lvl="warn", key="red_gain", value=data.get("red_gain"), reason=str(e))
 
     if "blue_gain" in data:
         try:
             current_blue_gain = clamp_gain(data["blue_gain"], "blue_gain")
+            accepted.append("blue_gain")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'blue_gain' key: {e}")
+            rejected.append("blue_gain")
+            emit("state.key_rejected", lvl="warn", key="blue_gain", value=data.get("blue_gain"), reason=str(e))
 
     if "roi" in data:
         val = data["roi"]
         if val is None:
             current_roi = None
+            accepted.append("roi")
         elif isinstance(val, str):
             parts = val.split(",")
             if len(parts) == 4:
                 try:
                     current_roi = validate_roi(parts[0], parts[1], parts[2], parts[3])
+                    accepted.append("roi")
                 except ValueError as e:
-                    print(f"[State] Dropping invalid 'roi' key: {e}")
+                    rejected.append("roi")
+                    emit("state.key_rejected", lvl="warn", key="roi", value=val, reason=str(e))
             else:
-                print(f"[State] Dropping invalid 'roi' key: string '{val}' does not have 4 parts")
+                rejected.append("roi")
+                emit("state.key_rejected", lvl="warn", key="roi", value=val, reason="Does not have 4 parts")
         else:
-            print(f"[State] Dropping invalid 'roi' key: value '{val}' is not string or null")
+            rejected.append("roi")
+            emit("state.key_rejected", lvl="warn", key="roi", value=val, reason="Value is not string or null")
 
     if "rotation" in data:
         try:
             current_rotation = validate_rotation(data["rotation"])
+            accepted.append("rotation")
         except ValueError as e:
-            print(f"[State] Dropping invalid 'rotation' key: {e}")
+            rejected.append("rotation")
+            emit("state.key_rejected", lvl="warn", key="rotation", value=data.get("rotation"), reason=str(e))
+
+    emit("state.loaded", lvl="info", path=path, accepted=accepted, rejected=rejected)
 
 
 load_state()
+
+
+def get_throttled_flags():
+    """Queries vcgencmd get_throttled and decodes bitwise flags. Called only by reconciler thread."""
+    try:
+        if not os.path.exists('/usr/bin/vcgencmd') and not os.path.exists('/bin/vcgencmd'):
+            return 0, []
+        out = subprocess.check_output(["vcgencmd", "get_throttled"]).decode('utf-8').strip()
+        val = int(out.split('=')[1], 16)
+        flags = []
+        if val & 0x1: flags.append("under_voltage_now")
+        if val & 0x2: flags.append("freq_capped_now")
+        if val & 0x4: flags.append("throttled_now")
+        if val & 0x10000: flags.append("under_voltage_since_boot")
+        if val & 0x20000: flags.append("freq_capped_since_boot")
+        if val & 0x40000: flags.append("throttled_since_boot")
+        return val, flags
+    except Exception as e:
+        emit("system.probe_failed", lvl="warn", source="vcgencmd", error=str(e))
+        return 0, []
 
 
 def get_system_stats():
@@ -289,13 +454,48 @@ def get_system_stats():
         if os.path.exists('/proc/loadavg'):
             with open('/proc/loadavg', 'r') as f:
                 stats['cpu_load'] = f.read().split()[0]
-    except Exception:
-        pass
+    except Exception as e:
+        emit("system.probe_failed", lvl="warn", source="get_system_stats", error=str(e))
     return stats
 
 
+def drain_stderr(proc, gen: int, pid: int):
+    """
+    Reads stderr line-by-line in a dedicated daemon thread to prevent pipe buffer deadlocks.
+    Emits camera.stderr events with a burst rate cap (20 lines max, then 1 line / 5s).
+    """
+    line_count = 0
+    last_emitted_time = 0.0
+    suppressed_count = 0
+
+    if not proc.stderr:
+        return
+
+    for line in iter(proc.stderr.readline, b''):
+        if not line:
+            break
+        text = line.decode('utf-8', errors='replace').strip()
+        if not text:
+            continue
+
+        now = time.monotonic()
+        line_count += 1
+
+        if line_count <= 20 or (now - last_emitted_time) >= 5.0:
+            if suppressed_count > 0:
+                emit("log.suppressed", lvl="warn", gen=gen, count=suppressed_count)
+                suppressed_count = 0
+            emit("camera.stderr", lvl="warn", gen=gen, pid=pid, line=text)
+            last_emitted_time = now
+        else:
+            suppressed_count += 1
+
+    if suppressed_count > 0:
+        emit("log.suppressed", lvl="warn", gen=gen, count=suppressed_count)
+
+
 def camera_worker():
-    global camera_process, restart_requested
+    global camera_process, restart_requested, current_gen, last_launched_argv, current_cause_seq, exit_timestamps
 
     while True:
         with camera_lock:
@@ -308,6 +508,7 @@ def camera_worker():
             blue_g = current_blue_gain
             rot = current_rotation
             restart_requested = False
+            cause_for_launch = current_cause_seq
 
         cmd = [
             "rpicam-vid",
@@ -322,9 +523,6 @@ def camera_worker():
         ]
 
         if mode == "night_outdoor":
-            # Long exposure skews the OV5647's auto white balance cold/blue; 1.80/1.30
-            # (red-heavy) compensates. Night mode presets always win over the AWB
-            # dropdown below, so a user-selected AWB mode never fights this.
             cmd.extend(["--shutter", "200000", "--gain", "8.0", "--awbgains", "1.80,1.30"])
         elif mode == "night_indoor":
             cmd.extend(["--shutter", "66000", "--gain", "4.0", "--awbgains", "1.70,1.40"])
@@ -344,25 +542,45 @@ def camera_worker():
         elif rot == "vflip":
             cmd.extend(["--vflip"])
 
-        print(f"[CameraWorker] Launching: {' '.join(cmd)}")
+        with camera_lock:
+            current_gen += 1
+            gen = current_gen
+            last_launched_argv = list(cmd)
+
+        emit("camera.launch_requested", lvl="info", cause=cause_for_launch, gen=gen, argv=cmd)
 
         try:
             with camera_lock:
-                camera_process = subprocess.Popen(cmd)
+                camera_process = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+                pid = camera_process.pid
+                start_time = time.monotonic()
         except Exception as e:
-            print(f"[CameraWorker] Failed to launch camera: {e}")
+            emit("camera.launch_failed", lvl="error", cause=cause_for_launch, gen=gen, error=str(e))
             time.sleep(5)
             continue
+
+        stderr_thread = threading.Thread(target=drain_stderr, args=(camera_process, gen, pid), daemon=True)
+        stderr_thread.start()
+
+        with camera_lock:
+            config_snap = current_state_dict()
+
+        emit("camera.launched", lvl="info", cause=cause_for_launch, gen=gen, pid=pid, argv=cmd, config_snapshot=config_snap)
+
+        break_reason = None
+        exit_cause = None
 
         while True:
             time.sleep(0.5)
             with camera_lock:
                 if restart_requested:
-                    print("[CameraWorker] Restart requested, terminating process...")
+                    break_reason = "restart_requested"
+                    exit_cause = current_cause_seq
+                    current_cause_seq = None
                     break
                 if camera_process.poll() is not None:
-                    print("[CameraWorker] Process died unexpectedly, restarting in 2s...")
-                    time.sleep(2)
+                    break_reason = "process_died"
+                    exit_cause = None
                     break
 
         with camera_lock:
@@ -373,7 +591,116 @@ def camera_worker():
                 except Exception:
                     pass
 
+            return_code = camera_process.poll() if camera_process else None
+
+        uptime = round(time.monotonic() - start_time, 1)
+        exit_code = None
+        signal_name = None
+
+        if return_code is not None:
+            if return_code < 0:
+                try:
+                    signal_name = signal.Signals(-return_code).name
+                except ValueError:
+                    signal_name = f"SIG_{abs(return_code)}"
+            else:
+                exit_code = return_code
+
+        was_expected = (break_reason == "restart_requested")
+
+        emit("camera.exited",
+             lvl="info" if was_expected else "warn",
+             cause=exit_cause,
+             gen=gen,
+             pid=pid,
+             exit_code=exit_code,
+             signal=signal_name,
+             uptime_s=uptime,
+             expected=was_expected)
+
+        now_t = time.monotonic()
+        exit_timestamps.append(now_t)
+        exit_timestamps = [t for t in exit_timestamps if (now_t - t) <= 60.0]
+
+        if len(exit_timestamps) >= 3:
+            emit("camera.crash_loop", lvl="error", gen=gen, exits_in_window=len(exit_timestamps), window_s=60)
+
+        if not was_expected:
+            emit("health.unexplained", lvl="error", what="camera_exit", gen=gen, detail="no restart_requested in generation")
+            time.sleep(2)
+
         time.sleep(1)
+
+
+def check_port_listening(port: int) -> bool:
+    """Scans /proc/net/tcp or /proc/net/tcp6 for hex port."""
+    hex_port = f"{port:04X}"
+    for proc_file in ['/proc/net/tcp', '/proc/net/tcp6']:
+        if os.path.exists(proc_file):
+            try:
+                with open(proc_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 4 and parts[3] == '0A':
+                            local_addr = parts[1]
+                            if local_addr.endswith(':' + hex_port):
+                                return True
+            except Exception:
+                pass
+    return False
+
+
+def reconciler_worker():
+    tick_seq = 0
+    state_file_path = get_state_file_path()
+    last_state_hash = None
+    gen_start_t = time.monotonic()
+
+    while True:
+        time.sleep(10)
+        tick_seq += 1
+
+        with camera_lock:
+            proc = camera_process
+            gen = current_gen
+            is_restart_req = restart_requested
+            argv_believed = list(last_launched_argv)
+
+        camera_alive = (proc is not None and proc.poll() is None)
+        port_listening = check_port_listening(STREAM_TCP_PORT)
+
+        emit("health.tick", lvl="info", tick_seq=tick_seq, camera_alive=camera_alive, port_8888_listening=port_listening)
+
+        # Emit system.sample telemetry every 10s to journald
+        stats = get_system_stats()
+        throttled_val, flags = get_throttled_flags()
+        emit("system.sample", lvl="info", temp_c=stats['temp'], ram_free_mb=stats['ram_free_mb'], load1=stats['cpu_load'], throttled=throttled_val, throttled_flags=flags)
+
+        if camera_thread is not None and not camera_thread.is_alive():
+            emit("health.drift", lvl="error", field="worker_thread", believed="alive", observed="dead", source="thread.is_alive")
+
+        # Gated drift check (not restart_requested, camera_alive, generation_age > 5.0s)
+        if not is_restart_req and camera_alive and (time.monotonic() - gen_start_t) > 5.0:
+            try:
+                cmdline_path = f"/proc/{proc.pid}/cmdline"
+                if os.path.exists(cmdline_path):
+                    with open(cmdline_path, "rb") as f:
+                        raw_cmd = f.read().decode('utf-8', errors='replace').split('\x00')
+                        raw_cmd = [x for x in raw_cmd if x]
+                    if argv_believed and raw_cmd != argv_believed:
+                        emit("health.drift", lvl="error", field="camera_argv", believed=argv_believed, observed=raw_cmd, source="/proc/cmdline")
+            except Exception as e:
+                emit("health.drift", lvl="warn", field="proc_check", error=str(e))
+
+        if os.path.exists(state_file_path):
+            try:
+                with open(state_file_path, "rb") as f:
+                    curr_hash = hashlib.sha256(f.read()).hexdigest()
+                if last_state_hash is not None and curr_hash != last_state_hash:
+                    emit("health.drift", lvl="info", field="state_file", believed="unmodified", observed="changed_on_disk", source="hash_check")
+                last_state_hash = curr_hash
+            except Exception:
+                pass
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -414,192 +741,287 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.handle_request(is_head=False)
 
     def handle_request(self, is_head=False):
-        """Dispatch HTTP GET and HEAD requests with atomic lock acquisition, validation, state mutation, state persistence, and response serialization."""
-        global current_res_key, current_width, current_height, current_fps
-        global current_roi, current_mode, current_awb, current_red_gain, current_blue_gain, current_rotation, restart_requested
-
         parsed = urlparse(self.path)
+        req_seq = None
+        start_t = time.monotonic()
 
-        if parsed.path == '/' or parsed.path == '/index.html':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(HTML_BYTES)))
-            self.end_headers()
-            if not is_head:
-                self.wfile.write(HTML_BYTES)
+        # Reserve seq for logged endpoints (excluding high-frequency /stats and /config polling)
+        if parsed.path not in ('/stats', '/config'):
+            req_seq = reserve_seq()
 
-        elif parsed.path == '/config':
-            with camera_lock:
-                state = current_state_dict()
-            self._send_json(state, status=200, is_head=is_head)
+        try:
+            if parsed.path == '/' or parsed.path == '/index.html':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(HTML_BYTES)))
+                self.end_headers()
+                if not is_head:
+                    self.wfile.write(HTML_BYTES)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/stats':
-            stats = get_system_stats()
-            self._send_json(stats, status=200, is_head=is_head)
+            elif parsed.path == '/config':
+                with camera_lock:
+                    state = current_state_dict()
+                self._send_json(state, status=200, is_head=is_head)
 
-        elif parsed.path == '/set_resolution':
-            query = parse_qs(parsed.query)
-            res_val = query.get('res', [''])[0]
-            with camera_lock:
+            elif parsed.path == '/stats':
+                stats = get_system_stats()
+                self._send_json(stats, status=200, is_head=is_head)
+
+            elif parsed.path == '/set_resolution':
+                query = parse_qs(parsed.query)
+                res_val = query.get('res', [''])[0]
                 try:
                     res = validate_res(res_val)
-                    if res != current_res_key:
-                        current_res_key = res
-                        current_width, current_height, _ = RESOLUTIONS[res]
-                        cap = FPS_LIMITS.get(current_res_key, 30)
-                        if current_fps > cap:
-                            current_fps = cap
-                        save_state()
-                        restart_requested = True
-                    state = current_state_dict()
+                    if apply_change("resolution", res, cause_seq=req_seq):
+                        request_restart(cause_seq=req_seq, reason="state_changed:resolution")
+                    with camera_lock:
+                        state = current_state_dict()
                 except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="res", value=res_val, reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
                     return
-            self._send_json(state, status=200, is_head=is_head)
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/set_fps':
-            query = parse_qs(parsed.query)
-            fps_raw = query.get('fps', [''])[0]
-            with camera_lock:
+            elif parsed.path == '/set_fps':
+                query = parse_qs(parsed.query)
+                fps_raw = query.get('fps', [''])[0]
                 try:
                     fps_val = validate_fps(fps_raw, current_res_key)
-                    if fps_val != current_fps:
-                        current_fps = fps_val
-                        save_state()
-                        restart_requested = True
-                    state = current_state_dict()
+                    if apply_change("fps", fps_val, cause_seq=req_seq):
+                        request_restart(cause_seq=req_seq, reason="state_changed:fps")
+                    with camera_lock:
+                        state = current_state_dict()
                 except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="fps", value=fps_raw, reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
                     return
-            self._send_json(state, status=200, is_head=is_head)
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/set_mode':
-            query = parse_qs(parsed.query)
-            mode_raw = query.get('mode', [''])[0]
-            with camera_lock:
+            elif parsed.path == '/set_mode':
+                query = parse_qs(parsed.query)
+                mode_raw = query.get('mode', [''])[0]
                 try:
                     mode_val = validate_mode(mode_raw)
-                    if mode_val != current_mode:
-                        current_mode = mode_val
-                        save_state()
-                        restart_requested = True
-                    state = current_state_dict()
+                    if apply_change("mode", mode_val, cause_seq=req_seq):
+                        request_restart(cause_seq=req_seq, reason="state_changed:mode")
+                    with camera_lock:
+                        state = current_state_dict()
                 except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="mode", value=mode_raw, reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
                     return
-            self._send_json(state, status=200, is_head=is_head)
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/set_crop':
-            query = parse_qs(parsed.query)
-            with camera_lock:
+            elif parsed.path == '/set_crop':
+                query = parse_qs(parsed.query)
                 try:
+                    changed = False
                     if 'reset' in query:
-                        current_roi = None
-                        save_state()
-                        restart_requested = True
+                        changed = apply_change("roi", None, cause_seq=req_seq)
                     elif 'x' in query and 'y' in query and 'w' in query and 'h' in query:
                         roi_str = validate_roi(query['x'][0], query['y'][0], query['w'][0], query['h'][0])
-                        current_roi = roi_str
-                        save_state()
-                        restart_requested = True
+                        changed = apply_change("roi", roi_str, cause_seq=req_seq)
                     else:
                         raise ValueError("Missing ROI parameters x, y, w, h or reset")
-                    state = current_state_dict()
+                    if changed:
+                        request_restart(cause_seq=req_seq, reason="state_changed:roi")
+                    with camera_lock:
+                        state = current_state_dict()
                 except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="crop", value=str(query), reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
                     return
-            self._send_json(state, status=200, is_head=is_head)
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/set_awb':
-            query = parse_qs(parsed.query)
-            with camera_lock:
+            elif parsed.path == '/set_awb':
+                query = parse_qs(parsed.query)
                 try:
-                    new_awb = current_awb
-                    new_red = current_red_gain
-                    new_blue = current_blue_gain
-
+                    c_awb = False
+                    c_red = False
+                    c_blue = False
                     if 'mode' in query:
-                        new_awb = validate_awb(query['mode'][0])
+                        c_awb = apply_change("awb", validate_awb(query['mode'][0]), cause_seq=req_seq)
                     if 'red' in query:
-                        new_red = clamp_gain(query['red'][0], 'red')
+                        c_red = apply_change("red_gain", clamp_gain(query['red'][0], 'red'), cause_seq=req_seq)
                     if 'blue' in query:
-                        new_blue = clamp_gain(query['blue'][0], 'blue')
+                        c_blue = apply_change("blue_gain", clamp_gain(query['blue'][0], 'blue'), cause_seq=req_seq)
 
-                    current_awb = new_awb
-                    current_red_gain = new_red
-                    current_blue_gain = new_blue
-                    save_state()
-                    restart_requested = True
-                    state = current_state_dict()
+                    # Single restart event for single or multi-field AWB changes
+                    if c_awb or c_red or c_blue:
+                        request_restart(cause_seq=req_seq, reason="state_changed:awb")
+
+                    with camera_lock:
+                        state = current_state_dict()
                 except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="awb", value=str(query), reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
                     return
-            self._send_json(state, status=200, is_head=is_head)
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/set_rotation':
-            query = parse_qs(parsed.query)
-            rot_raw = query.get('rot', [''])[0]
-            with camera_lock:
+            elif parsed.path == '/set_rotation':
+                query = parse_qs(parsed.query)
+                rot_raw = query.get('rot', [''])[0]
                 try:
                     rot_val = validate_rotation(rot_raw)
-                    if rot_val != current_rotation:
-                        current_rotation = rot_val
-                        save_state()
-                        restart_requested = True
-                    state = current_state_dict()
+                    if apply_change("rotation", rot_val, cause_seq=req_seq):
+                        request_restart(cause_seq=req_seq, reason="state_changed:rotation")
+                    with camera_lock:
+                        state = current_state_dict()
                 except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="rot", value=rot_raw, reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
                     return
-            self._send_json(state, status=200, is_head=is_head)
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
 
-        elif parsed.path == '/snapshot.jpg':
-            with camera_lock:
-                rot_str = str(current_rotation)
-            try:
-                cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
-                if rot_str == "180":
-                    cmd.extend(["--rotation", "180"])
-                elif rot_str == "hflip":
-                    cmd.extend(["--hflip"])
-                elif rot_str == "vflip":
-                    cmd.extend(["--vflip"])
-                jpeg_data = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/jpeg')
-                self.send_header('Content-Length', str(len(jpeg_data)))
-                self.end_headers()
-                if not is_head:
-                    self.wfile.write(jpeg_data)
-            except Exception as e:
-                err_msg = f"Snapshot failed: {e}".encode('utf-8')
-                self.send_response(500)
+            elif parsed.path == '/snapshot.jpg':
+                with camera_lock:
+                    rot_str = str(current_rotation)
+                snap_seq = emit("snapshot.requested", lvl="info", cause=req_seq, rotation=rot_str)
+                snap_t = time.monotonic()
+                try:
+                    cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
+                    if rot_str == "180":
+                        cmd.extend(["--rotation", "180"])
+                    elif rot_str == "hflip":
+                        cmd.extend(["--hflip"])
+                    elif rot_str == "vflip":
+                        cmd.extend(["--vflip"])
+
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    stdout_data, stderr_data = proc.communicate()
+                    snap_dur = int((time.monotonic() - snap_t) * 1000)
+
+                    if proc.returncode == 0:
+                        emit("snapshot.ok", lvl="info", cause=snap_seq, bytes=len(stdout_data), dur_ms=snap_dur)
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'image/jpeg')
+                        self.send_header('Content-Length', str(len(stdout_data)))
+                        self.end_headers()
+                        if not is_head:
+                            self.wfile.write(stdout_data)
+                        dur_ms = int((time.monotonic() - start_t) * 1000)
+                        emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
+                    else:
+                        err_text = stderr_data.decode('utf-8', errors='replace')[:2048]
+                        emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=proc.returncode, stderr=err_text, dur_ms=snap_dur)
+                        err_msg = f"Snapshot failed: {err_text}".encode('utf-8')
+                        self.send_response(500)
+                        self.send_header('Content-Type', 'text/plain')
+                        self.send_header('Content-Length', str(len(err_msg)))
+                        self.end_headers()
+                        if not is_head:
+                            self.wfile.write(err_msg)
+                        dur_ms = int((time.monotonic() - start_t) * 1000)
+                        emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=500, dur_ms=dur_ms)
+                except Exception as e:
+                    snap_dur = int((time.monotonic() - snap_t) * 1000)
+                    emit("snapshot.failed", lvl="error", cause=snap_seq, returncode=-1, stderr=str(e), dur_ms=snap_dur)
+                    err_msg = f"Snapshot failed: {e}".encode('utf-8')
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'text/plain')
+                    self.send_header('Content-Length', str(len(err_msg)))
+                    self.end_headers()
+                    if not is_head:
+                        self.wfile.write(err_msg)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=500, dur_ms=dur_ms)
+
+            else:
+                self.send_response(404)
                 self.send_header('Content-Type', 'text/plain')
-                self.send_header('Content-Length', str(len(err_msg)))
+                self.send_header('Content-Length', '14')
                 self.end_headers()
                 if not is_head:
-                    self.wfile.write(err_msg)
+                    self.wfile.write(b"Page Not Found")
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=404, dur_ms=dur_ms)
+        except Exception as e:
+            dur_ms = int((time.monotonic() - start_t) * 1000)
+            if req_seq is not None:
+                emit("http.request", lvl="error", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=500, dur_ms=dur_ms, error=str(e))
+            raise
 
-        else:
-            self.send_response(404)
-            self.send_header('Content-Type', 'text/plain')
-            self.send_header('Content-Length', '14')
-            self.end_headers()
-            if not is_head:
-                self.wfile.write(b"Page Not Found")
+
+def handle_uncaught_exception(exc_type, exc_value, exc_tb):
+    tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    emit("server.crashed", lvl="error", exc_type=exc_type.__name__, exc_msg=str(exc_value), traceback=tb_str, thread="main")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def handle_thread_exception(args):
+    tb_str = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    emit("server.crashed", lvl="error", exc_type=args.exc_type.__name__, exc_msg=str(args.exc_value), traceback=tb_str, thread=args.thread.name)
+
+
+def on_exit():
+    emit("server.stopping", lvl="info", reason="atexit")
+
+
+def setup_crash_hooks():
+    sys.excepthook = handle_uncaught_exception
+    if hasattr(threading, 'excepthook'):
+        threading.excepthook = handle_thread_exception
+
+    atexit.register(on_exit)
+
+    def shutdown_handler(signum, frame):
+        try:
+            sig_name = signal.Signals(signum).name
+        except ValueError:
+            sig_name = str(signum)
+        emit("server.stopping", lvl="info", signal=sig_name, reason="signal_received")
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        signal.signal(signal.SIGINT, shutdown_handler)
+    except (ValueError, AttributeError):
+        pass
 
 
 def main():
-    t = threading.Thread(target=camera_worker, daemon=True)
-    t.start()
+    global camera_thread, reconciler_thread
+    setup_crash_hooks()
 
-    print("[Main] Initializing H.264 GPU Stream Engine & Web Server...")
+    camera_thread = threading.Thread(target=camera_worker, daemon=True, name="CameraWorker")
+    camera_thread.start()
+
+    reconciler_thread = threading.Thread(target=reconciler_worker, daemon=True, name="ReconcilerWorker")
+    reconciler_thread.start()
+
+    emit("server.started", lvl="info", pid=os.getpid(), py_version=sys.version.split()[0], boot_id=RUN_ID, config_snapshot=current_state_dict())
 
     server = ThreadedHTTPServer(('0.0.0.0', PORT), StreamHandler)
-    print(f"[Main] Control Server running on http://0.0.0.0:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("[Main] Server shutting down...")
+        emit("server.stopping", lvl="info", reason="keyboard_interrupt")
     finally:
         server.server_close()
 

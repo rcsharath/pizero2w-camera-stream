@@ -9,6 +9,7 @@ WorkingDirectory=/home/rcsharath/camerastream
 ExecStart=/usr/bin/python3 -u /home/rcsharath/camerastream/stream_server.py
 Restart=always
 RestartSec=10s
+RateLimitIntervalSec=0
 KillMode=process
 
 [Install]
