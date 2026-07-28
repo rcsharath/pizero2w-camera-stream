@@ -19,3 +19,5 @@ Thumbs.db
 *.mkv
 recorder.lock
 
+# Test baselines
+tests/baseline/

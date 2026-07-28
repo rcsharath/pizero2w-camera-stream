@@ -1,12 +1,12 @@
 [Unit]
-Description=Pi Zero 2W Camera Live View MJPEG Stream Server
+Description=Pi Zero 2W Camera H.264 Stream and Control Server
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/home/rcsharath/camerastream
-ExecStart=/usr/bin/python3 /home/rcsharath/camerastream/stream_server.py
+ExecStart=/usr/bin/python3 -u /home/rcsharath/camerastream/stream_server.py
 Restart=always
 RestartSec=10s
 KillMode=process

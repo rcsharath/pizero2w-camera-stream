@@ -27,6 +27,23 @@ RESOLUTIONS = {
     "320x240": (320, 240, "320×240 (Ultra-Low Latency 4:3)")
 }
 
+# Per-resolution fps ceilings. 640x480, 1296x972, and 1920x1080 come from the
+# documented OV5647 sensor mode table in Hardware.md, floored to int. 1280x720
+# and 320x240 are software-scaled outputs with no documented native fps; they
+# keep the previous flat 30 cap until verified on real hardware. Do not raise
+# 1280x720 or 320x240 without an on-device check first.
+FPS_LIMITS = {
+    "1920x1080": 32,
+    "1296x972": 46,
+    "1280x720": 30,
+    "640x480": 58,
+    "320x240": 30,
+}
+
+VALID_MODES = frozenset({"day", "night_indoor", "night_outdoor"})
+VALID_AWB = frozenset({"auto", "indoor", "incandescent", "tungsten", "custom"})
+VALID_ROTATIONS = frozenset({"0", "180", "hflip", "vflip"})
+
 current_res_key = "1296x972"
 current_width, current_height, _ = RESOLUTIONS[current_res_key]
 current_fps = 15
@@ -45,6 +62,208 @@ restart_requested = False
 camera_lock = threading.Lock()
 
 
+def validate_res(res_val):
+    if res_val not in RESOLUTIONS:
+        raise ValueError(f"Invalid res parameter '{res_val}'; must be one of {sorted(list(RESOLUTIONS.keys()))}")
+    return res_val
+
+
+def validate_fps(fps_val, res_key=None):
+    try:
+        val = int(fps_val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid fps parameter '{fps_val}'; must be an integer")
+    if res_key is None:
+        res_key = current_res_key
+    cap = FPS_LIMITS.get(res_key, 30)
+    if not (5 <= val <= cap):
+        raise ValueError(f"Invalid fps parameter '{fps_val}'; must be between 5 and {cap} for resolution '{res_key}'")
+    return val
+
+
+def validate_mode(mode_val):
+    if mode_val not in VALID_MODES:
+        raise ValueError(f"Invalid mode parameter '{mode_val}'; must be one of {sorted(list(VALID_MODES))}")
+    return mode_val
+
+
+def validate_awb(awb_val):
+    if awb_val not in VALID_AWB:
+        raise ValueError(f"Invalid awb parameter '{awb_val}'; must be one of {sorted(list(VALID_AWB))}")
+    return awb_val
+
+
+def validate_rotation(rot_val):
+    rot_str = str(rot_val)
+    if rot_str not in VALID_ROTATIONS:
+        raise ValueError(f"Invalid rot parameter '{rot_val}'; must be one of {sorted(list(VALID_ROTATIONS))}")
+    return rot_str
+
+
+def clamp_gain(gain_val, param_name="gain"):
+    try:
+        val = float(gain_val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid {param_name} parameter '{gain_val}'; must be a number")
+    return max(1.0, min(3.0, val))
+
+
+def validate_roi(x_val, y_val, w_val, h_val):
+    try:
+        x = float(x_val)
+        y = float(y_val)
+        w = float(w_val)
+        h = float(h_val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid ROI parameters x='{x_val}', y='{y_val}', w='{w_val}', h='{h_val}'; all must be numbers")
+
+    if x < -1e-9:
+        raise ValueError(f"Invalid ROI x='{x_val}'; must be >= 0.0")
+    if y < -1e-9:
+        raise ValueError(f"Invalid ROI y='{y_val}'; must be >= 0.0")
+    if not (0.05 <= w <= 1.0):
+        raise ValueError(f"Invalid ROI w='{w_val}'; must be between 0.05 and 1.0")
+    if not (0.05 <= h <= 1.0):
+        raise ValueError(f"Invalid ROI h='{h_val}'; must be between 0.05 and 1.0")
+    if x + w > 1.0 + 1e-9:
+        raise ValueError(f"Invalid ROI x='{x_val}' and w='{w_val}'; x + w ({x+w}) exceeds 1.0")
+    if y + h > 1.0 + 1e-9:
+        raise ValueError(f"Invalid ROI y='{y_val}' and h='{h_val}'; y + h ({y+h}) exceeds 1.0")
+
+    return f"{x},{y},{w},{h}"
+
+
+def current_state_dict():
+    resolutions_map = {k: v[2] for k, v in RESOLUTIONS.items()}
+    return {
+        "resolution": current_res_key,
+        "width": current_width,
+        "height": current_height,
+        "fps": current_fps,
+        "mode": current_mode,
+        "awb": current_awb,
+        "red_gain": current_red_gain,
+        "blue_gain": current_blue_gain,
+        "roi": current_roi,
+        "rotation": current_rotation,
+        "resolutions": resolutions_map,
+        "fps_limits": dict(FPS_LIMITS),
+        "modes": ["day", "night_indoor", "night_outdoor"],
+        "awb_modes": ["auto", "indoor", "incandescent", "tungsten", "custom"],
+        "rotations": ["0", "180", "hflip", "vflip"],
+        "stream_port": STREAM_TCP_PORT
+    }
+
+
+def get_state_file_path():
+    state_dir = os.environ.get("CAMERASTREAM_STATE_DIR", os.path.expanduser("~/.config/camerastream"))
+    return os.path.join(state_dir, "state.json")
+
+
+def save_state():
+    try:
+        path = get_state_file_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "resolution": current_res_key,
+            "fps": current_fps,
+            "mode": current_mode,
+            "awb": current_awb,
+            "red_gain": current_red_gain,
+            "blue_gain": current_blue_gain,
+            "roi": current_roi,
+            "rotation": current_rotation,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[State] Error saving state: {e}")
+
+
+def load_state():
+    global current_res_key, current_width, current_height, current_fps
+    global current_mode, current_awb, current_red_gain, current_blue_gain, current_roi, current_rotation
+
+    path = get_state_file_path()
+    if not os.path.exists(path):
+        print(f"[State] State file absent at {path}; using default state")
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[State] Failed to read/parse state file at {path} ({e}); using default state")
+        return
+
+    if not isinstance(data, dict):
+        print(f"[State] State file contents at {path} are not a JSON object; using default state")
+        return
+
+    if "resolution" in data:
+        try:
+            res_val = validate_res(data["resolution"])
+            current_res_key = res_val
+            current_width, current_height, _ = RESOLUTIONS[current_res_key]
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'resolution' key: {e}")
+
+    if "fps" in data:
+        try:
+            current_fps = validate_fps(data["fps"], current_res_key)
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'fps' key: {e}")
+
+    if "mode" in data:
+        try:
+            current_mode = validate_mode(data["mode"])
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'mode' key: {e}")
+
+    if "awb" in data:
+        try:
+            current_awb = validate_awb(data["awb"])
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'awb' key: {e}")
+
+    if "red_gain" in data:
+        try:
+            current_red_gain = clamp_gain(data["red_gain"], "red_gain")
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'red_gain' key: {e}")
+
+    if "blue_gain" in data:
+        try:
+            current_blue_gain = clamp_gain(data["blue_gain"], "blue_gain")
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'blue_gain' key: {e}")
+
+    if "roi" in data:
+        val = data["roi"]
+        if val is None:
+            current_roi = None
+        elif isinstance(val, str):
+            parts = val.split(",")
+            if len(parts) == 4:
+                try:
+                    current_roi = validate_roi(parts[0], parts[1], parts[2], parts[3])
+                except ValueError as e:
+                    print(f"[State] Dropping invalid 'roi' key: {e}")
+            else:
+                print(f"[State] Dropping invalid 'roi' key: string '{val}' does not have 4 parts")
+        else:
+            print(f"[State] Dropping invalid 'roi' key: value '{val}' is not string or null")
+
+    if "rotation" in data:
+        try:
+            current_rotation = validate_rotation(data["rotation"])
+        except ValueError as e:
+            print(f"[State] Dropping invalid 'rotation' key: {e}")
+
+
+load_state()
+
+
 def get_system_stats():
     """Retrieve system telemetry directly from procfs with 0 external dependencies."""
     stats = {"temp": 0.0, "ram_free_mb": 0, "ram_total_mb": 416, "cpu_load": "0.00"}
@@ -60,11 +279,12 @@ def get_system_stats():
                     parts = line.split(':')
                     if len(parts) == 2:
                         key = parts[0].strip()
-                        val = parts[1].split()[0].strip()
+                        val = parts[1].strip().split()[0]
                         mem[key] = int(val)
-            if 'MemTotal' in mem and 'MemAvailable' in mem:
-                stats['ram_total_mb'] = mem['MemTotal'] // 1024
+            if 'MemAvailable' in mem:
                 stats['ram_free_mb'] = mem['MemAvailable'] // 1024
+            elif 'MemFree' in mem:
+                stats['ram_free_mb'] = mem['MemFree'] // 1024
 
         if os.path.exists('/proc/loadavg'):
             with open('/proc/loadavg', 'r') as f:
@@ -75,91 +295,83 @@ def get_system_stats():
 
 
 def camera_worker():
-    """Background thread managing Hardware VideoCore H.264 GPU Stream Server."""
     global camera_process, restart_requested
-    
+
     while True:
         with camera_lock:
-            w, h, fps = current_width, current_height, current_fps
+            res_w, res_h = current_width, current_height
+            fps = current_fps
             roi = current_roi
             mode = current_mode
             awb = current_awb
-            rgain = current_red_gain
-            bgain = current_blue_gain
+            red_g = current_red_gain
+            blue_g = current_blue_gain
             rot = current_rotation
             restart_requested = False
 
         cmd = [
             "rpicam-vid",
             "-t", "0",
-            "--codec", "h264",
-            "--width", str(w),
-            "--height", str(h),
-            "--framerate", str(fps),
             "--inline",
+            "--width", str(res_w),
+            "--height", str(res_h),
+            "--framerate", str(fps),
+            "--codec", "h264",
             "--listen",
-            "-o", f"tcp://0.0.0.0:{STREAM_TCP_PORT}",
-            "--nopreview",
-            "-v", "0"
+            "-o", f"tcp://0.0.0.0:{STREAM_TCP_PORT}"
         ]
 
-        # Mode Specific Presets (Outdoor Night vs Day)
         if mode == "night_outdoor":
-            cmd.extend([
-                "--shutter", "100000",   # 100ms long exposure
-                "--gain", "6.0",         # High analog gain boost
-                "--awbgains", "1.80,1.30"# Night outdoor white balance
-            ])
+            # Long exposure skews the OV5647's auto white balance cold/blue; 1.80/1.30
+            # (red-heavy) compensates. Night mode presets always win over the AWB
+            # dropdown below, so a user-selected AWB mode never fights this.
+            cmd.extend(["--shutter", "200000", "--gain", "8.0", "--awbgains", "1.80,1.30"])
         elif mode == "night_indoor":
-            cmd.extend([
-                "--shutter", "60000",    # 60ms exposure
-                "--gain", "4.0",
-                "--awbgains", "1.70,1.40"
-            ])
+            cmd.extend(["--shutter", "66000", "--gain", "4.0", "--awbgains", "1.70,1.40"])
         else:
-            # Day / Standard Mode
             if awb == "custom":
-                cmd.extend(["--awbgains", f"{rgain:.2f},{bgain:.2f}"])
-            elif awb and awb != "auto":
+                cmd.extend(["--awb", "custom", "--awbgains", f"{red_g},{blue_g}"])
+            elif awb != "auto":
                 cmd.extend(["--awb", awb])
 
         if roi:
             cmd.extend(["--roi", roi])
 
-        rot_str = str(rot)
-        if rot_str == "180":
+        if rot == "180":
             cmd.extend(["--rotation", "180"])
-        elif rot_str == "hflip":
+        elif rot == "hflip":
             cmd.extend(["--hflip"])
-        elif rot_str == "vflip":
+        elif rot == "vflip":
             cmd.extend(["--vflip"])
 
+        print(f"[CameraWorker] Launching: {' '.join(cmd)}")
+
         try:
-            print(f"[Camera H.264 GPU] Launching TCP Server on port {STREAM_TCP_PORT} ({w}x{h} @ {fps}fps, mode={mode}, awb={awb}, rot={rot_str})...")
-            camera_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-
-            while not restart_requested:
-                if camera_process.poll() is not None:
-                    print("[Camera] rpicam-vid process exited. Restarting in 3s...")
-                    time.sleep(3)
-                    break
-                time.sleep(1)
-
+            with camera_lock:
+                camera_process = subprocess.Popen(cmd)
         except Exception as e:
-            print(f"[Camera Error] {e}")
+            print(f"[CameraWorker] Failed to launch camera: {e}")
             time.sleep(5)
+            continue
 
-        # Clean shutdown before restart
-        if camera_process:
-            try:
+        while True:
+            time.sleep(0.5)
+            with camera_lock:
+                if restart_requested:
+                    print("[CameraWorker] Restart requested, terminating process...")
+                    break
+                if camera_process.poll() is not None:
+                    print("[CameraWorker] Process died unexpectedly, restarting in 2s...")
+                    time.sleep(2)
+                    break
+
+        with camera_lock:
+            if camera_process and camera_process.poll() is None:
                 camera_process.terminate()
-                camera_process.wait(timeout=2)
-            except Exception:
-                pass
+                try:
+                    camera_process.wait(timeout=2)
+                except Exception:
+                    pass
 
         time.sleep(1)
 
@@ -168,642 +380,12 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pi Zero 2W H.264 Control Dashboard</title>
-    <style>
-        :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --text-color: #f8fafc;
-            --text-muted: #94a3b8;
-            --accent-color: #38bdf8;
-            --success-color: #22c55e;
-            --warning-color: #f59e0b;
-            --danger-color: #ef4444;
-            --border-color: #334155;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        }
-
-        body {
-            background-color: var(--bg-color);
-            color: var(--text-color);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 1.5rem;
-        }
-
-        header {
-            width: 100%;
-            max-width: 850px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1.5rem;
-            flex-wrap: wrap;
-            gap: 0.75rem;
-        }
-
-        .title-group {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-        }
-
-        h1 {
-            font-size: 1.5rem;
-            font-weight: 600;
-        }
-
-        .badge {
-            background-color: rgba(34, 197, 94, 0.15);
-            color: var(--success-color);
-            border: 1px solid rgba(34, 197, 94, 0.3);
-            padding: 0.25rem 0.6rem;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-        }
-
-        .badge-dot {
-            width: 6px;
-            height: 6px;
-            background-color: var(--success-color);
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.3; }
-            100% { opacity: 1; }
-        }
-
-        .stats-group {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-
-        .stat-badge {
-            background-color: #1e293b;
-            border: 1px solid var(--border-color);
-            padding: 0.3rem 0.6rem;
-            border-radius: 6px;
-            font-size: 0.75rem;
-            font-weight: 500;
-            color: var(--text-muted);
-            transition: all 0.3s ease;
-        }
-
-        .stat-badge span {
-            color: var(--text-color);
-            font-weight: 600;
-        }
-
-        .main-card {
-            width: 100%;
-            max-width: 850px;
-            background-color: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
-        }
-
-        .stream-info-banner {
-            background-color: #0f172a;
-            padding: 1.25rem;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-        }
-
-        .banner-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-        }
-
-        .code-box {
-            background-color: #1e293b;
-            border: 1px solid var(--border-color);
-            padding: 0.5rem 0.75rem;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 0.85rem;
-            color: var(--accent-color);
-            word-break: break-all;
-        }
-
-        .controls-bar {
-            padding: 1rem 1.25rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 0.75rem;
-        }
-
-        .tools-panel {
-            width: 100%;
-            max-width: 850px;
-            margin-top: 1rem;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 1rem;
-        }
-
-        .panel-box {
-            background-color: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            padding: 1rem;
-        }
-
-        .panel-title {
-            font-size: 0.95rem;
-            font-weight: 600;
-            margin-bottom: 0.75rem;
-            color: var(--accent-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .slider-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-            font-size: 0.85rem;
-            margin-bottom: 0.75rem;
-        }
-
-        .slider-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .slider-row label {
-            width: 95px;
-            color: var(--text-muted);
-        }
-
-        .slider-row input[type=range] {
-            flex: 1;
-            accent-color: var(--accent-color);
-        }
-
-        .slider-row span {
-            width: 45px;
-            text-align: right;
-            font-family: monospace;
-        }
-
-        .info-group {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            flex-wrap: wrap;
-        }
-
-        select {
-            background-color: #0f172a;
-            color: var(--text-color);
-            border: 1px solid var(--border-color);
-            padding: 0.4rem 0.6rem;
-            border-radius: 6px;
-            font-size: 0.85rem;
-            cursor: pointer;
-            outline: none;
-        }
-
-        select:focus {
-            border-color: var(--accent-color);
-        }
-
-        .btn {
-            background-color: var(--accent-color);
-            color: #0f172a;
-            border: none;
-            padding: 0.45rem 0.85rem;
-            border-radius: 6px;
-            font-weight: 600;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.4rem;
-        }
-
-        .btn:hover {
-            opacity: 0.9;
-            transform: translateY(-1px);
-        }
-
-        .btn-secondary {
-            background-color: #334155;
-            color: var(--text-color);
-        }
-
-        .btn-night {
-            background-color: #8b5cf6;
-            color: #ffffff;
-        }
-
-        .header-actions {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .btn-group {
-            display: flex;
-            gap: 0.5rem;
-            margin-top: 0.5rem;
-        }
-
-        footer {
-            margin-top: 2rem;
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            text-align: center;
-        }
-    </style>
-</head>
-<body>
-    <header>
-        <div class="title-group">
-            <h1>Pi Zero 2W H.264 Camera</h1>
-            <div class="badge">
-                <div class="badge-dot"></div>
-                GPU H.264 ACTIVE
-            </div>
-        </div>
-
-        <!-- System Telemetry Badges (0% Overhead) -->
-        <div class="stats-group">
-            <div class="stat-badge" id="tempBadge">🌡️ <span id="tempVal">--</span>°C</div>
-            <div class="stat-badge">🧠 <span id="ramVal">--</span> MB free</div>
-            <div class="stat-badge">⚡ Load: <span id="loadVal">--</span></div>
-        </div>
-
-        <div class="header-actions">
-            <a href="/snapshot.jpg" download="snapshot.jpg" class="btn">📷 Take 5MP Snapshot</a>
-        </div>
-    </header>
-
-    <div class="main-card">
-        <div class="stream-info-banner">
-            <div class="banner-row">
-                <strong style="color: var(--accent-color);">🚀 Hardware H.264 Video Engine Output (Port 8888)</strong>
-                <span style="font-size: 0.75rem; color: var(--success-color);">⚡ Low Overhead H.264 Hardware Stream</span>
-            </div>
-            <div class="code-box">
-                VLC / OBS Stream URL: <strong>tcp/h264://rcsharathpi.local:8888</strong>
-            </div>
-            <div style="font-size: 0.8rem; color: var(--text-muted);">
-                Open <code>open_vlc_stream.bat</code> on your PC to view live, or run <code>record_stream.bat</code> to record 24/7 in MP4.
-            </div>
-        </div>
-
-        <div class="controls-bar">
-            <div class="info-group">
-                <label for="resSelect">Resolution:</label>
-                <select id="resSelect" onchange="changeResolution(this.value)">
-                    <option value="1296x972" selected>1296×972 (Full Frame Native 4:3)</option>
-                    <option value="1920x1080">1920×1080 (Full HD 16:9)</option>
-                    <option value="1280x720">1280×720 (Smooth HD 16:9)</option>
-                    <option value="640x480">640×480 (Smooth Motion 4:3)</option>
-                    <option value="320x240">320×240 (Ultra-Low Latency 4:3)</option>
-                </select>
-
-                <label for="fpsSelect" style="margin-left: 1rem;">Frame Rate:</label>
-                <select id="fpsSelect" onchange="changeFPS(this.value)">
-                    <option value="5">5 FPS</option>
-                    <option value="10">10 FPS</option>
-                    <option value="15" selected>15 FPS</option>
-                    <option value="20">20 FPS</option>
-                    <option value="25">25 FPS</option>
-                    <option value="30">30 FPS</option>
-                </select>
-
-                <div class="info-item" style="margin-left: auto;">Current Mode: <span id="modeDisplay" style="color:var(--accent-color); font-weight:600;">Day / Auto</span></div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Advanced Controls Panel -->
-    <div class="tools-panel">
-        <!-- Day / Outdoor Night Mode Presets -->
-        <div class="panel-box">
-            <div class="panel-title">
-                🌙 Exposure & Lighting Modes
-                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">Hardware Shutter/Gain</span>
-            </div>
-            <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-                Select lighting preset for outdoor/night surveillance:
-            </div>
-            <div class="btn-group" style="flex-wrap: wrap;">
-                <button class="btn" onclick="setLightingMode('day')">☀️ Day / Standard</button>
-                <button class="btn btn-night" onclick="setLightingMode('night_outdoor')">🌙 Outdoor Night Mode (Long Exp)</button>
-                <button class="btn btn-secondary" onclick="setLightingMode('night_indoor')">💡 Indoor Dim Mode</button>
-            </div>
-        </div>
-
-        <!-- Hardware Crop (ROI) -->
-        <div class="panel-box">
-            <div class="panel-title">
-                ✂️ Hardware Crop (ROI)
-                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">GPU Hardware ISP</span>
-            </div>
-            <div class="slider-group">
-                <div class="slider-row">
-                    <label>Left Offset:</label>
-                    <input type="range" id="cropX" min="0" max="80" value="0" oninput="updateCropValues()">
-                    <span id="cropValX">0%</span>
-                </div>
-                <div class="slider-row">
-                    <label>Top Offset:</label>
-                    <input type="range" id="cropY" min="0" max="80" value="0" oninput="updateCropValues()">
-                    <span id="cropValY">0%</span>
-                </div>
-                <div class="slider-row">
-                    <label>Width:</label>
-                    <input type="range" id="cropW" min="20" max="100" value="100" oninput="updateCropValues()">
-                    <span id="cropValW">100%</span>
-                </div>
-                <div class="slider-row">
-                    <label>Height:</label>
-                    <input type="range" id="cropH" min="20" max="100" value="100" oninput="updateCropValues()">
-                    <span id="cropValH">100%</span>
-                </div>
-            </div>
-            <div class="btn-group">
-                <button class="btn" onclick="applyHardwareCrop()">✂️ Apply Hardware Crop</button>
-                <button class="btn btn-secondary" onclick="resetCrop()">🔄 Reset Full Frame</button>
-            </div>
-        </div>
-
-        <!-- Color Balance Tuning -->
-        <div class="panel-box">
-            <div class="panel-title">
-                🎨 Color Balance Tuning
-                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">Hardware ISP</span>
-            </div>
-            <div class="slider-group">
-                <div class="slider-row">
-                    <label for="awbSelect">AWB Mode:</label>
-                    <select id="awbSelect" style="flex:1;" onchange="toggleAwbMode(this.value)">
-                        <option value="auto">Auto (Default)</option>
-                        <option value="indoor">Indoor (Warm Neutral)</option>
-                        <option value="incandescent">Incandescent</option>
-                        <option value="tungsten">Tungsten</option>
-                        <option value="custom">Custom Red/Blue Gains</option>
-                    </select>
-                </div>
-                <div id="customGainsGroup" style="display: none;">
-                    <div class="slider-row" style="margin-top: 0.5rem;">
-                        <label>Red Gain:</label>
-                        <input type="range" id="redGain" min="1.0" max="3.0" step="0.05" value="1.70" oninput="updateGainLabels()">
-                        <span id="redGainVal">1.70</span>
-                    </div>
-                    <div class="slider-row">
-                        <label>Blue Gain:</label>
-                        <input type="range" id="blueGain" min="1.0" max="3.0" step="0.05" value="1.40" oninput="updateGainLabels()">
-                        <span id="blueGainVal">1.40</span>
-                    </div>
-                </div>
-            </div>
-            <div class="btn-group" style="margin-top: 1rem;">
-                <button class="btn" onclick="applyColorBalance()">🎨 Apply Color Tuning</button>
-            </div>
-        </div>
-
-        <!-- Hardware GPU Orientation & Sensor Flips -->
-        <div class="panel-box">
-            <div class="panel-title">
-                🔄 Hardware Sensor Orientation & Flips
-                <span style="font-weight: normal; font-size: 0.75rem; color: var(--text-muted);">0% CPU Hardware ISP</span>
-            </div>
-            <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-                Click button to invert stream orientation 180° or apply mirror flips in hardware:
-            </div>
-            <div class="btn-group" style="flex-wrap: wrap;">
-                <button class="btn" id="rotateToggleBtn" onclick="toggle180Rotation()">🔄 Rotate to 180° (Inverted)</button>
-                <button class="btn btn-secondary" id="rotBtnHflip" onclick="setHardwareRotation('hflip')">↔️ Mirror Horizontal</button>
-                <button class="btn btn-secondary" id="rotBtnVflip" onclick="setHardwareRotation('vflip')">↕️ Mirror Vertical</button>
-            </div>
-            <div style="margin-top: 0.75rem; font-size: 0.8rem; color: var(--text-muted);">
-                Active Mode: <strong id="activeRotLabel" style="color: var(--accent-color);">0° (Normal)</strong>
-                <span id="rotStatusToast" style="margin-left: 0.5rem; font-size: 0.75rem; color: var(--success-color); display: none;">✓ Applied</span>
-            </div>
-            <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #94a3b8; background-color: #0f172a; padding: 0.4rem 0.6rem; border-radius: 4px;">
-                💡 <em>Note: 0°, 180°, and Mirror flips execute in camera hardware (0% CPU). 90°/270° transpose is unsupported by OV5647 hardware ISP; for 90° portrait rotation, use VLC Video Effects (Geometry) on host PC.</em>
-            </div>
-        </div>
-    </div>
-
-    <footer>
-        Zero-Overhead GPU Hardware H.264 Encoder &bull; Raspberry Pi Zero 2W Stream Server
-    </footer>
-
-    <script>
-        function changeResolution(val) {
-            fetch('/set_resolution?res=' + val)
-                .then(res => res.json())
-                .then(data => {
-                    console.log('Resolution set:', data);
-                });
-        }
-
-        function changeFPS(val) {
-            fetch('/set_fps?fps=' + val)
-                .then(res => res.json())
-                .then(data => {
-                    console.log('FPS set:', data);
-                });
-        }
-
-        let currentRotationState = '0';
-
-        function toggle180Rotation() {
-            const nextRot = (currentRotationState === '180') ? '0' : '180';
-            setHardwareRotation(nextRot);
-        }
-
-        function setHardwareRotation(rot) {
-            const toast = document.getElementById('rotStatusToast');
-            if (toast) {
-                toast.style.display = 'inline';
-                toast.innerText = 'Applying...';
-            }
-            fetch('/set_rotation?rot=' + rot)
-                .then(res => res.json())
-                .then(data => {
-                    currentRotationState = data.rotation;
-                    updateRotationUI(data.rotation);
-                    if (toast) {
-                        toast.innerText = '✓ Applied';
-                        setTimeout(() => { toast.style.display = 'none'; }, 2000);
-                    }
-                    console.log('Hardware rotation applied:', data);
-                });
-        }
-
-        function updateRotationUI(rot) {
-            const rotStr = String(rot);
-            currentRotationState = rotStr;
-            const toggleBtn = document.getElementById('rotateToggleBtn');
-            if (toggleBtn) {
-                if (rotStr === '180') {
-                    toggleBtn.innerText = '🔄 Rotate to 0° (Normal)';
-                    toggleBtn.className = 'btn';
-                } else {
-                    toggleBtn.innerText = '🔄 Rotate to 180° (Inverted)';
-                    toggleBtn.className = (rotStr === '0') ? 'btn' : 'btn btn-secondary';
-                }
-            }
-            ['hflip', 'vflip'].forEach(r => {
-                const btnId = r === 'hflip' ? 'rotBtnHflip' : 'rotBtnVflip';
-                const btn = document.getElementById(btnId);
-                if (btn) {
-                    btn.className = (r === rotStr) ? 'btn' : 'btn btn-secondary';
-                }
-            });
-            const label = document.getElementById('activeRotLabel');
-            if (label) {
-                const names = {'0': '0° (Normal)', '180': '180° (Inverted)', 'hflip': 'Horizontal Mirror', 'vflip': 'Vertical Mirror'};
-                label.innerText = names[rotStr] || rotStr;
-            }
-        }
-
-        function setLightingMode(mode) {
-            fetch('/set_mode?mode=' + mode)
-                .then(res => res.json())
-                .then(data => {
-                    const label = (mode === 'night_outdoor') ? '🌙 Outdoor Night Mode' : (mode === 'night_indoor' ? '💡 Indoor Dim Mode' : '☀️ Day / Standard');
-                    document.getElementById('modeDisplay').innerText = label;
-                });
-        }
-
-        /* Hardware Crop (ROI) Functions */
-        function updateCropValues() {
-            const x = parseInt(document.getElementById('cropX').value);
-            const y = parseInt(document.getElementById('cropY').value);
-            const w = parseInt(document.getElementById('cropW').value);
-            const h = parseInt(document.getElementById('cropH').value);
-
-            document.getElementById('cropValX').innerText = x + '%';
-            document.getElementById('cropValY').innerText = y + '%';
-            document.getElementById('cropValW').innerText = w + '%';
-            document.getElementById('cropValH').innerText = h + '%';
-        }
-
-        function applyHardwareCrop() {
-            const x = (parseInt(document.getElementById('cropX').value) / 100.0).toFixed(2);
-            const y = (parseInt(document.getElementById('cropY').value) / 100.0).toFixed(2);
-            const w = (parseInt(document.getElementById('cropW').value) / 100.0).toFixed(2);
-            const h = (parseInt(document.getElementById('cropH').value) / 100.0).toFixed(2);
-
-            fetch(`/set_crop?x=${x}&y=${y}&w=${w}&h=${h}`)
-                .then(res => res.json())
-                .then(data => {
-                    console.log('Hardware Crop applied:', data);
-                });
-        }
-
-        function resetCrop() {
-            document.getElementById('cropX').value = 0;
-            document.getElementById('cropY').value = 0;
-            document.getElementById('cropW').value = 100;
-            document.getElementById('cropH').value = 100;
-            updateCropValues();
-
-            fetch('/set_crop?reset=1')
-                .then(res => res.json())
-                .then(data => {
-                    console.log('Crop reset:', data);
-                });
-        }
-
-        function toggleAwbMode(val) {
-            const gainsGroup = document.getElementById('customGainsGroup');
-            gainsGroup.style.display = (val === 'custom') ? 'block' : 'none';
-        }
-
-        function updateGainLabels() {
-            document.getElementById('redGainVal').innerText = parseFloat(document.getElementById('redGain').value).toFixed(2);
-            document.getElementById('blueGainVal').innerText = parseFloat(document.getElementById('blueGain').value).toFixed(2);
-        }
-
-        function applyColorBalance() {
-            const mode = document.getElementById('awbSelect').value;
-            const red = parseFloat(document.getElementById('redGain').value).toFixed(2);
-            const blue = parseFloat(document.getElementById('blueGain').value).toFixed(2);
-
-            fetch(`/set_awb?mode=${mode}&red=${red}&blue=${blue}`)
-                .then(res => res.json())
-                .then(data => {
-                    console.log('Color balance updated:', data);
-                });
-        }
-
-        /* System Telemetry Polling (0% Overhead) */
-        function pollStats() {
-            fetch('/stats')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('tempVal').innerText = data.temp;
-                    document.getElementById('ramVal').innerText = data.ram_free_mb;
-                    document.getElementById('loadVal').innerText = data.cpu_load;
-
-                    const tempBadge = document.getElementById('tempBadge');
-                    if (data.temp > 78) {
-                        tempBadge.style.borderColor = '#ef4444';
-                        tempBadge.style.color = '#ef4444';
-                    } else if (data.temp > 68) {
-                        tempBadge.style.borderColor = '#f59e0b';
-                        tempBadge.style.color = '#f59e0b';
-                    } else {
-                        tempBadge.style.borderColor = '#334155';
-                        tempBadge.style.color = 'var(--text-muted)';
-                    }
-                }).catch(() => {});
-        }
-
-        window.addEventListener('DOMContentLoaded', () => {
-            setInterval(pollStats, 3000);
-            pollStats();
-        });
-    </script>
-</body>
-</html>
-"""
+HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'index.html')
+if not os.path.exists(HTML_PATH):
+    raise RuntimeError(f"Static HTML dashboard missing at: {HTML_PATH}")
+
+with open(HTML_PATH, 'r', encoding='utf-8') as f:
+    HTML_BYTES = f.read().encode('utf-8')
 
 
 class StreamHandler(BaseHTTPRequestHandler):
@@ -812,13 +394,28 @@ class StreamHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+    def _send_json(self, data, status=200, is_head=False):
+        body = json.dumps(data).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-cache, private')
         self.end_headers()
+        if not is_head:
+            self.wfile.write(body)
+
+    def _send_error(self, reason, status=400, is_head=False):
+        self._send_json({"error": reason}, status=status, is_head=is_head)
+
+    def do_HEAD(self):
+        self.handle_request(is_head=True)
 
     def do_GET(self):
-        global current_res_key, current_width, current_height, current_fps, current_quality
+        self.handle_request(is_head=False)
+
+    def handle_request(self, is_head=False):
+        """Dispatch HTTP GET and HEAD requests with atomic lock acquisition, validation, state mutation, state persistence, and response serialization."""
+        global current_res_key, current_width, current_height, current_fps
         global current_roi, current_mode, current_awb, current_red_gain, current_blue_gain, current_rotation, restart_requested
 
         parsed = urlparse(self.path)
@@ -826,123 +423,140 @@ class StreamHandler(BaseHTTPRequestHandler):
         if parsed.path == '/' or parsed.path == '/index.html':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(HTML_PAGE.encode('utf-8'))))
+            self.send_header('Content-Length', str(len(HTML_BYTES)))
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode('utf-8'))
+            if not is_head:
+                self.wfile.write(HTML_BYTES)
+
+        elif parsed.path == '/config':
+            with camera_lock:
+                state = current_state_dict()
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/stats':
             stats = get_system_stats()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.end_headers()
-            self.wfile.write(json.dumps(stats).encode('utf-8'))
+            self._send_json(stats, status=200, is_head=is_head)
 
         elif parsed.path == '/set_resolution':
             query = parse_qs(parsed.query)
-            res = query.get('res', ['1296x972'])[0]
-
-            if res in RESOLUTIONS and res != current_res_key:
-                current_res_key = res
-                current_width, current_height, _ = RESOLUTIONS[res]
-                restart_requested = True
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            resp = f'{{"status":"ok","res":"{current_res_key}","width":{current_width},"height":{current_height},"fps":{current_fps}}}'
-            self.wfile.write(resp.encode('utf-8'))
+            res_val = query.get('res', [''])[0]
+            with camera_lock:
+                try:
+                    res = validate_res(res_val)
+                    if res != current_res_key:
+                        current_res_key = res
+                        current_width, current_height, _ = RESOLUTIONS[res]
+                        cap = FPS_LIMITS.get(current_res_key, 30)
+                        if current_fps > cap:
+                            current_fps = cap
+                        save_state()
+                        restart_requested = True
+                    state = current_state_dict()
+                except ValueError as e:
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    return
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/set_fps':
             query = parse_qs(parsed.query)
-            try:
-                fps_val = int(query.get('fps', [15])[0])
-                if 5 <= fps_val <= 30 and fps_val != current_fps:
-                    current_fps = fps_val
-                    restart_requested = True
-            except (ValueError, IndexError):
-                pass
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            resp = f'{{"status":"ok","fps":{current_fps}}}'
-            self.wfile.write(resp.encode('utf-8'))
+            fps_raw = query.get('fps', [''])[0]
+            with camera_lock:
+                try:
+                    fps_val = validate_fps(fps_raw, current_res_key)
+                    if fps_val != current_fps:
+                        current_fps = fps_val
+                        save_state()
+                        restart_requested = True
+                    state = current_state_dict()
+                except ValueError as e:
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    return
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/set_mode':
             query = parse_qs(parsed.query)
-
-            if 'mode' in query:
-                current_mode = query['mode'][0]
-                restart_requested = True
-
-            if 'mode' in query:
-                current_mode = query['mode'][0]
-                restart_requested = True
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            resp = f'{{"status":"ok","mode":"{current_mode}"}}'
-            self.wfile.write(resp.encode('utf-8'))
+            mode_raw = query.get('mode', [''])[0]
+            with camera_lock:
+                try:
+                    mode_val = validate_mode(mode_raw)
+                    if mode_val != current_mode:
+                        current_mode = mode_val
+                        save_state()
+                        restart_requested = True
+                    state = current_state_dict()
+                except ValueError as e:
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    return
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/set_crop':
             query = parse_qs(parsed.query)
-
-            if 'reset' in query:
-                current_roi = None
-                restart_requested = True
-            elif 'x' in query and 'y' in query and 'w' in query and 'h' in query:
-                x = query['x'][0]
-                y = query['y'][0]
-                w = query['w'][0]
-                h = query['h'][0]
-                current_roi = f"{x},{y},{w},{h}"
-                restart_requested = True
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            resp = f'{{"status":"ok","roi":"{current_roi}"}}'
-            self.wfile.write(resp.encode('utf-8'))
+            with camera_lock:
+                try:
+                    if 'reset' in query:
+                        current_roi = None
+                        save_state()
+                        restart_requested = True
+                    elif 'x' in query and 'y' in query and 'w' in query and 'h' in query:
+                        roi_str = validate_roi(query['x'][0], query['y'][0], query['w'][0], query['h'][0])
+                        current_roi = roi_str
+                        save_state()
+                        restart_requested = True
+                    else:
+                        raise ValueError("Missing ROI parameters x, y, w, h or reset")
+                    state = current_state_dict()
+                except ValueError as e:
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    return
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/set_awb':
             query = parse_qs(parsed.query)
+            with camera_lock:
+                try:
+                    new_awb = current_awb
+                    new_red = current_red_gain
+                    new_blue = current_blue_gain
 
-            if 'mode' in query:
-                current_awb = query['mode'][0]
-            if 'red' in query:
-                current_red_gain = float(query['red'][0])
-            if 'blue' in query:
-                current_blue_gain = float(query['blue'][0])
+                    if 'mode' in query:
+                        new_awb = validate_awb(query['mode'][0])
+                    if 'red' in query:
+                        new_red = clamp_gain(query['red'][0], 'red')
+                    if 'blue' in query:
+                        new_blue = clamp_gain(query['blue'][0], 'blue')
 
-            restart_requested = True
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            resp = f'{{"status":"ok","awb":"{current_awb}","red":{current_red_gain},"blue":{current_blue_gain}}}'
-            self.wfile.write(resp.encode('utf-8'))
+                    current_awb = new_awb
+                    current_red_gain = new_red
+                    current_blue_gain = new_blue
+                    save_state()
+                    restart_requested = True
+                    state = current_state_dict()
+                except ValueError as e:
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    return
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/set_rotation':
             query = parse_qs(parsed.query)
-            if 'rot' in query:
-                rot_val = query['rot'][0]
-                if rot_val in ("0", "180", "hflip", "vflip") and rot_val != str(current_rotation):
-                    current_rotation = rot_val
-                    restart_requested = True
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            resp = f'{{"status":"ok","rotation":"{current_rotation}"}}'
-            self.wfile.write(resp.encode('utf-8'))
+            rot_raw = query.get('rot', [''])[0]
+            with camera_lock:
+                try:
+                    rot_val = validate_rotation(rot_raw)
+                    if rot_val != current_rotation:
+                        current_rotation = rot_val
+                        save_state()
+                        restart_requested = True
+                    state = current_state_dict()
+                except ValueError as e:
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    return
+            self._send_json(state, status=200, is_head=is_head)
 
         elif parsed.path == '/snapshot.jpg':
-            # Capture full 5MP still image using rpicam-still on demand
+            with camera_lock:
+                rot_str = str(current_rotation)
             try:
                 cmd = ["rpicam-still", "--immediate", "--width", "2592", "--height", "1944", "-o", "-"]
-                rot_str = str(current_rotation)
                 if rot_str == "180":
                     cmd.extend(["--rotation", "180"])
                 elif rot_str == "hflip":
@@ -954,12 +568,24 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'image/jpeg')
                 self.send_header('Content-Length', str(len(jpeg_data)))
                 self.end_headers()
-                self.wfile.write(jpeg_data)
+                if not is_head:
+                    self.wfile.write(jpeg_data)
             except Exception as e:
-                self.send_error(500, f"Snapshot failed: {e}")
+                err_msg = f"Snapshot failed: {e}".encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-Type', 'text/plain')
+                self.send_header('Content-Length', str(len(err_msg)))
+                self.end_headers()
+                if not is_head:
+                    self.wfile.write(err_msg)
 
         else:
-            self.send_error(404, "Page Not Found")
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', '14')
+            self.end_headers()
+            if not is_head:
+                self.wfile.write(b"Page Not Found")
 
 
 def main():

@@ -16,11 +16,11 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
 - **🎨 Color Balance & White Balance Tuning:** Hardware ISP AWB presets (Indoor, Incandescent, Tungsten) and custom Red/Blue gain multipliers (`--awbgains`).
 - **📊 Real-Time System Telemetry:** Header metrics badges polling directly from procfs with zero overhead (`/stats` — CPU Temp °C, Free RAM MB, System Load).
 - **🎬 1-Click Windows Desktop Launchers:**
-  - `record_and_preview.bat` — **Primary Entry Point:** Simultaneously records H.264 video into timestamped `.mp4` chunks AND launches live low-latency preview in VLC via PC-side UDP relay with 0% extra Pi CPU.
+  - `record_and_preview.bat` — **Primary Entry Point:** Simultaneously records H.264 video into timestamped `.mp4` chunks AND launches live low-latency preview in VLC via PC-side UDP relay.
   - `open_vlc_stream.bat` — Smart viewer script that connects to host UDP relay when recording, or falls back to direct Pi TCP stream when standalone.
   - `record_stream.bat` — Multi-output FFmpeg recorder saving 90-second `.mp4` segments while broadcasting local UDP loopback (`udp://127.0.0.1:8889`).
 - **🔒 Single-Instance Protection & Auto-Cleanup:** Automated lockfile handling (`recorder.lock`) with active process checking (`ffmpeg.exe`) to prevent duplicate runs and auto-clear stale locks.
-- **📷 On-Demand 5MP Snapshot Engine (`/snapshot.jpg`):** Captures native 2592×1944 high-resolution stills on demand without interrupting the stream.
+- **📷 On-Demand 5MP Snapshot Engine (`/snapshot.jpg`):** Captures native 2592×1944 high-resolution stills on demand.
 - **⚙️ Autostart Systemd Service:** User-level `systemd` service (`camerastream.service`) for automatic boot launch without root privileges.
 
 ---
@@ -44,6 +44,7 @@ Offloads video encoding 100% to the **Raspberry Pi VideoCore GPU hardware block*
    │                                                             │
    │   1. HTTP Control Server (Port 8000)                        │
    │      - System Telemetry (/stats)                            │
+   │      - Server Configuration State (/config)                 │
    │      - Independent Resolution & FPS (/set_resolution, /set_fps)
    │      - Lighting Presets & Color Balance (/set_mode, /set_awb)│
    │      - Hardware Crop & Orientation (/set_crop, /set_rotation)│
@@ -103,8 +104,11 @@ loginctl enable-linger $USER
 
 ## 🛠️ Web API Reference
 
+Mutating endpoints return the full server `/config` state on success. On invalid input parameters, mutating endpoints return HTTP 400 with a JSON error body `{"error": "<reason>"}`.
+
 | Endpoint | Method | Parameters | Description |
 | :--- | :--- | :--- | :--- |
+| `/config` | `GET` | None | Returns full server state JSON and available configuration options. |
 | `/stats` | `GET` | None | Returns live JSON system telemetry (`temp`, `ram_free_mb`, `cpu_load`). |
 | `/set_resolution` | `GET` | `res=1296x972` | Changes hardware video encoding resolution ($1296\times 972$, $1920\times 1080$, $1280\times 720$, $640\times 480$, $320\times 240$). |
 | `/set_fps` | `GET` | `fps=15` | Configures video frame rate (5 to 30 FPS). |
@@ -118,7 +122,7 @@ loginctl enable-linger $USER
 
 ## 🛡️ Security & Privacy Notice
 
-This repository contains **zero credentials, hardcoded passwords, or private keys**. All communication relies on standard local network mDNS (`rcsharathpi.local`) and user-configurable ports.
+There is no access control or authentication on the server; it should remain on a trusted local area network (LAN).
 
 ---
 

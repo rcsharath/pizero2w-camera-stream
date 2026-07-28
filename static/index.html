@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pi Zero 2W - Camera Stream Control</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-color: #38bdf8;
+            --accent-hover: #0284c7;
+            --success-color: #4ade80;
+            --error-color: #f87171;
+            --border-color: #334155;
+            --border-radius: 8px;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            box-sizing: border-box;
+        }
+
+        .dashboard-container {
+            max-width: 960px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+        }
+
+        .status-strip {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius);
+            padding: 1rem 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+
+        .device-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .device-name {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin: 0;
+        }
+
+        .status-pill {
+            background-color: rgba(74, 222, 128, 0.15);
+            color: var(--success-color);
+            padding: 0.2rem 0.6rem;
+            border-radius: 9999px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            border: 1px solid rgba(74, 222, 128, 0.3);
+        }
+
+        .telemetry {
+            font-family: monospace;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            display: flex;
+            gap: 1rem;
+        }
+
+        .main-panes {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.25rem;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius);
+            padding: 1.25rem;
+            margin-bottom: 1.25rem;
+        }
+
+        .card:last-child {
+            margin-bottom: 0;
+        }
+
+        .card-title {
+            font-size: 1.05rem;
+            font-weight: 600;
+            margin-top: 0;
+            margin-bottom: 1rem;
+            color: var(--text-main);
+        }
+
+        .control-group {
+            margin-bottom: 1rem;
+        }
+
+        .control-group:last-child {
+            margin-bottom: 0;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 0.4rem;
+        }
+
+        select, button, input[type="range"] {
+            width: 100%;
+            padding: 0.6rem;
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            border-radius: 6px;
+            font-size: 0.9rem;
+            box-sizing: border-box;
+        }
+
+        select:focus, button:focus {
+            outline: 2px solid var(--accent-color);
+        }
+
+        .slider-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .slider-row label {
+            width: 70px;
+            margin-bottom: 0;
+        }
+
+        .slider-row input {
+            flex: 1;
+        }
+
+        .slider-row span {
+            width: 45px;
+            text-align: right;
+            font-size: 0.85rem;
+            font-family: monospace;
+        }
+
+        .btn {
+            background-color: var(--accent-color);
+            color: #0f172a;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+            transition: background-color 0.2s;
+            text-align: center;
+            display: inline-block;
+            text-decoration: none;
+        }
+
+        .btn:hover {
+            background-color: var(--accent-hover);
+        }
+
+        .btn-secondary {
+            background-color: transparent;
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover {
+            background-color: var(--border-color);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .mode-btn {
+            flex: 1;
+            padding: 0.6rem 0.4rem;
+            font-size: 0.85rem;
+        }
+
+        .mode-btn.active {
+            background-color: var(--accent-color);
+            color: #0f172a;
+        }
+
+        footer {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius);
+            padding: 1rem 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            font-size: 0.85rem;
+        }
+
+        .stream-url-box {
+            font-family: monospace;
+            background-color: var(--bg-color);
+            padding: 0.5rem 0.75rem;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            color: var(--accent-color);
+            word-break: break-all;
+        }
+
+        .copy-btn {
+            width: auto;
+            padding: 0.5rem 1rem;
+        }
+
+        .reconnect-note {
+            background-color: rgba(56, 189, 248, 0.08);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            border-radius: var(--border-radius);
+            padding: 0.75rem 1rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            line-height: 1.4;
+        }
+
+        #toastContainer {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            z-index: 1000;
+            pointer-events: none;
+        }
+
+        .toast {
+            background-color: var(--card-bg);
+            color: var(--text-main);
+            padding: 0.75rem 1.25rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+            border-left: 4px solid var(--accent-color);
+            pointer-events: auto;
+            animation: fadeIn 0.2s ease-in-out;
+        }
+
+        .toast.ok {
+            border-left-color: var(--success-color);
+        }
+
+        .toast.error {
+            border-left-color: var(--error-color);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 700px) {
+            .main-panes {
+                grid-template-columns: 1fr;
+            }
+
+            .status-strip {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.5rem;
+            }
+
+            footer {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .copy-btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard-container">
+        <div class="status-strip">
+            <div class="device-info">
+                <h1 class="device-name">Pi Zero 2W Stream Server</h1>
+                <span class="status-pill">Active</span>
+            </div>
+            <div class="telemetry">
+                <span id="statTemp">-- °C</span> |
+                <span id="statRam">-- MB</span> |
+                <span id="statCpu">Load --</span>
+            </div>
+        </div>
+
+        <div class="main-panes">
+            <!-- Left Pane: Crop & Snapshot -->
+            <div class="pane-left">
+                <div class="card">
+                    <h2 class="card-title">Digital Hardware Crop (ROI)</h2>
+                    <div class="slider-group">
+                        <div class="slider-row">
+                            <label for="cropX">X Offset</label>
+                            <input type="range" id="cropX" min="0" max="80" value="0" oninput="updateCropLabels()">
+                            <span id="cropValX">0%</span>
+                        </div>
+                        <div class="slider-row">
+                            <label for="cropY">Y Offset</label>
+                            <input type="range" id="cropY" min="0" max="80" value="0" oninput="updateCropLabels()">
+                            <span id="cropValY">0%</span>
+                        </div>
+                        <div class="slider-row">
+                            <label for="cropW">Width</label>
+                            <input type="range" id="cropW" min="5" max="100" value="100" oninput="updateCropLabels()">
+                            <span id="cropValW">100%</span>
+                        </div>
+                        <div class="slider-row">
+                            <label for="cropH">Height</label>
+                            <input type="range" id="cropH" min="5" max="100" value="100" oninput="updateCropLabels()">
+                            <span id="cropValH">100%</span>
+                        </div>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn" onclick="applyCrop()">Apply Hardware Crop</button>
+                        <button class="btn btn-secondary" onclick="resetCrop()">Reset Full Frame</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="card-title">Hardware Snapshot</h2>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0; margin-bottom: 1rem;">
+                        Trigger 5MP full-sensor capture (2592x1944) on demand.
+                    </p>
+                    <a href="/snapshot.jpg" target="_blank" class="btn btn-secondary" style="width: 100%;">
+                        Take 5MP Snapshot
+                    </a>
+                </div>
+            </div>
+
+            <!-- Right Pane: Video Settings, Mode & Color -->
+            <div class="pane-right">
+                <div class="card">
+                    <h2 class="card-title">Video Settings</h2>
+                    <div class="control-group">
+                        <label for="resSelect">Resolution & Aspect Ratio</label>
+                        <select id="resSelect" onchange="changeResolution(this.value)"></select>
+                    </div>
+                    <div class="control-group">
+                        <label for="fpsSelect">Target Frame Rate (FPS)</label>
+                        <select id="fpsSelect" onchange="changeFps(this.value)"></select>
+                    </div>
+                    <div class="control-group">
+                        <label>Sensor Orientation <span style="color: var(--text-muted); font-weight: normal;">(hardware supports 0&deg;/180&deg;/mirror only, no true 90&deg;)</span></label>
+                        <button class="btn" id="rotCycleBtn" onclick="cycleRotation()">Rotate: 0&deg; (Normal)</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="card-title">Lighting Mode</h2>
+                    <div class="btn-group">
+                        <button class="btn mode-btn btn-secondary" id="modeBtnDay" onclick="setMode('day')">Day Mode</button>
+                        <button class="btn mode-btn btn-secondary" id="modeBtnNightIndoor" onclick="setMode('night_indoor')">Night Indoor</button>
+                        <button class="btn mode-btn btn-secondary" id="modeBtnNightOutdoor" onclick="setMode('night_outdoor')">Night Outdoor</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2 class="card-title">Color Balance</h2>
+                    <div class="control-group">
+                        <label for="awbSelect">AWB Mode</label>
+                        <select id="awbSelect" onchange="toggleAwbMode(this.value)"></select>
+                    </div>
+                    <div id="customGainsGroup" style="display: none; margin-top: 0.75rem;">
+                        <div class="slider-group">
+                            <div class="slider-row">
+                                <label for="redGain">Red Gain</label>
+                                <input type="range" id="redGain" min="1.0" max="3.0" step="0.05" value="1.70" oninput="updateGainLabels()">
+                                <span id="redGainVal">1.70</span>
+                            </div>
+                            <div class="slider-row">
+                                <label for="blueGain">Blue Gain</label>
+                                <input type="range" id="blueGain" min="1.0" max="3.0" step="0.05" value="1.40" oninput="updateGainLabels()">
+                                <span id="blueGainVal">1.40</span>
+                            </div>
+                        </div>
+                        <button class="btn" onclick="applyColorBalance()">Apply Color Tuning</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="reconnect-note">
+            Any control change on this page restarts the H.264 stream (new resolution, mode, AWB, crop, or rotation).
+            Your video player's connection drops when that happens. If the picture freezes or goes black after
+            clicking something, close and reopen the stream URL below.
+        </div>
+
+        <footer>
+            <div>
+                <span>Stream URL: </span>
+                <code class="stream-url-box" id="streamUrlDisplay">Loading...</code>
+            </div>
+            <button class="btn copy-btn" onclick="copyStreamUrl()">Copy Stream URL</button>
+        </footer>
+    </div>
+
+    <div id="toastContainer"></div>
+
+    <script>
+        function toast(message, kind) {
+            const container = document.getElementById('toastContainer');
+            const el = document.createElement('div');
+            el.className = 'toast ' + (kind || 'ok');
+            el.innerText = message;
+            container.appendChild(el);
+            const duration = (kind === 'error') ? 6000 : 4000;
+            setTimeout(() => {
+                if (el.parentNode) el.parentNode.removeChild(el);
+            }, duration);
+        }
+
+        function apiCall(url) {
+            return fetch(url)
+                .then(r => r.json().then(data => ({ status: r.status, data: data })))
+                .then(res => {
+                    if (res.status >= 200 && res.status < 300) {
+                        toast("Applied. Stream is restarting, reopen your player if the picture freezes.", "ok");
+                        hydrate(res.data);
+                        return res.data;
+                    } else {
+                        const msg = (res.data && res.data.error) ? res.data.error : "Request failed";
+                        toast(msg, "error");
+                        throw new Error(msg);
+                    }
+                })
+                .catch(err => {
+                    if (err.message && !err.message.includes("Request failed") && !err.message.includes("Invalid")) {
+                        toast("Network error: " + err.message, "error");
+                    }
+                });
+        }
+
+        function hydrate(config) {
+            if (!config) return;
+
+            // Stream URL
+            const host = location.hostname || 'localhost';
+            const streamUrl = `tcp/h264://${host}:${config.stream_port}`;
+            document.getElementById('streamUrlDisplay').innerText = streamUrl;
+
+            // Resolutions dropdown
+            const resSelect = document.getElementById('resSelect');
+            resSelect.innerHTML = '';
+            if (config.resolutions) {
+                Object.keys(config.resolutions).forEach(key => {
+                    const opt = document.createElement('option');
+                    opt.value = key;
+                    opt.innerText = config.resolutions[key];
+                    if (key === config.resolution) opt.selected = true;
+                    resSelect.appendChild(opt);
+                });
+            }
+
+            // FPS - rebuilt per resolution's documented ceiling
+            const fpsSelect = document.getElementById('fpsSelect');
+            if (fpsSelect && config.fps_limits) {
+                const cap = config.fps_limits[config.resolution] || 30;
+                const baseLabels = {
+                    30: "30 FPS (High Motion)",
+                    20: "20 FPS (Balanced)",
+                    15: "15 FPS (Default Security)",
+                    10: "10 FPS (Low Latency / Night)",
+                    5: "5 FPS (Ultra Low Bandwidth)"
+                };
+                let rungs = Object.keys(baseLabels).map(Number).filter(v => v <= cap);
+                if (cap > 30 && !rungs.includes(cap)) rungs.push(cap);
+                rungs.sort((a, b) => b - a);
+                fpsSelect.innerHTML = '';
+                rungs.forEach(v => {
+                    const opt = document.createElement('option');
+                    opt.value = String(v);
+                    opt.innerText = baseLabels[v] || `${v} FPS (Hardware Max)`;
+                    if (v === Number(config.fps)) opt.selected = true;
+                    fpsSelect.appendChild(opt);
+                });
+            }
+
+            // Rotation cycle button: hardware only supports these 4 states (no true 90/270
+            // on the OV5647 ISP), so this is a single button that steps through them.
+            currentRotationState = String(config.rotation);
+            if (config.rotations && config.rotations.length) {
+                rotationCycle = config.rotations;
+            }
+            updateRotationButton();
+
+            // Lighting Mode buttons
+            const modeMap = {
+                'day': 'modeBtnDay',
+                'night_indoor': 'modeBtnNightIndoor',
+                'night_outdoor': 'modeBtnNightOutdoor'
+            };
+            Object.keys(modeMap).forEach(m => {
+                const btn = document.getElementById(modeMap[m]);
+                if (btn) {
+                    if (m === config.mode) {
+                        btn.classList.add('active');
+                        btn.classList.remove('btn-secondary');
+                    } else {
+                        btn.classList.remove('active');
+                        btn.classList.add('btn-secondary');
+                    }
+                }
+            });
+
+            // AWB Modes dropdown
+            const awbSelect = document.getElementById('awbSelect');
+            awbSelect.innerHTML = '';
+            const awbLabels = {
+                "auto": "Auto (Default)",
+                "indoor": "Indoor (Warm Neutral)",
+                "incandescent": "Incandescent",
+                "tungsten": "Tungsten",
+                "custom": "Custom Red / Blue Gains"
+            };
+            if (config.awb_modes) {
+                config.awb_modes.forEach(a => {
+                    const opt = document.createElement('option');
+                    opt.value = a;
+                    opt.innerText = awbLabels[a] || a;
+                    if (a === config.awb) opt.selected = true;
+                    awbSelect.appendChild(opt);
+                });
+            }
+
+            // Custom Gains
+            const customGainsGroup = document.getElementById('customGainsGroup');
+            if (config.awb === 'custom') {
+                customGainsGroup.style.display = 'block';
+                if (config.red_gain !== undefined) {
+                    document.getElementById('redGain').value = config.red_gain;
+                }
+                if (config.blue_gain !== undefined) {
+                    document.getElementById('blueGain').value = config.blue_gain;
+                }
+                updateGainLabels();
+            } else {
+                customGainsGroup.style.display = 'none';
+            }
+
+            // ROI Crop sliders
+            if (config.roi) {
+                const parts = config.roi.split(',');
+                if (parts.length === 4) {
+                    document.getElementById('cropX').value = Math.round(parseFloat(parts[0]) * 100);
+                    document.getElementById('cropY').value = Math.round(parseFloat(parts[1]) * 100);
+                    document.getElementById('cropW').value = Math.round(parseFloat(parts[2]) * 100);
+                    document.getElementById('cropH').value = Math.round(parseFloat(parts[3]) * 100);
+                }
+            } else {
+                document.getElementById('cropX').value = 0;
+                document.getElementById('cropY').value = 0;
+                document.getElementById('cropW').value = 100;
+                document.getElementById('cropH').value = 100;
+            }
+            updateCropLabels();
+        }
+
+        function changeResolution(val) {
+            apiCall('/set_resolution?res=' + encodeURIComponent(val));
+        }
+
+        function changeFps(val) {
+            apiCall('/set_fps?fps=' + encodeURIComponent(val));
+        }
+
+        const rotLabels = {
+            "0": "0° (Normal)",
+            "180": "180° (Inverted)",
+            "hflip": "Mirror Horizontal (hflip)",
+            "vflip": "Mirror Vertical (vflip)"
+        };
+        let rotationCycle = ["0", "180", "hflip", "vflip"];
+        let currentRotationState = "0";
+
+        function updateRotationButton() {
+            const btn = document.getElementById('rotCycleBtn');
+            if (btn) {
+                btn.innerText = 'Rotate: ' + (rotLabels[currentRotationState] || currentRotationState);
+            }
+        }
+
+        function cycleRotation() {
+            const idx = rotationCycle.indexOf(currentRotationState);
+            const next = rotationCycle[(idx + 1) % rotationCycle.length];
+            apiCall('/set_rotation?rot=' + encodeURIComponent(next)).then(data => {
+                if (data && data.rotation !== undefined) {
+                    currentRotationState = String(data.rotation);
+                    updateRotationButton();
+                }
+            });
+        }
+
+        function setMode(mode) {
+            apiCall('/set_mode?mode=' + encodeURIComponent(mode));
+        }
+
+        function toggleAwbMode(val) {
+            const customGainsGroup = document.getElementById('customGainsGroup');
+            if (val === 'custom') {
+                customGainsGroup.style.display = 'block';
+                applyColorBalance();
+            } else {
+                customGainsGroup.style.display = 'none';
+                apiCall('/set_awb?mode=' + encodeURIComponent(val));
+            }
+        }
+
+        function updateGainLabels() {
+            const red = parseFloat(document.getElementById('redGain').value).toFixed(2);
+            const blue = parseFloat(document.getElementById('blueGain').value).toFixed(2);
+            document.getElementById('redGainVal').innerText = red;
+            document.getElementById('blueGainVal').innerText = blue;
+        }
+
+        function applyColorBalance() {
+            const awb = document.getElementById('awbSelect').value;
+            let url = '/set_awb?mode=' + encodeURIComponent(awb);
+            if (awb === 'custom') {
+                const red = document.getElementById('redGain').value;
+                const blue = document.getElementById('blueGain').value;
+                url += `&red=${encodeURIComponent(red)}&blue=${encodeURIComponent(blue)}`;
+            }
+            apiCall(url);
+        }
+
+        function updateCropLabels() {
+            document.getElementById('cropValX').innerText = document.getElementById('cropX').value + '%';
+            document.getElementById('cropValY').innerText = document.getElementById('cropY').value + '%';
+            document.getElementById('cropValW').innerText = document.getElementById('cropW').value + '%';
+            document.getElementById('cropValH').innerText = document.getElementById('cropH').value + '%';
+        }
+
+        function applyCrop() {
+            const x = (parseFloat(document.getElementById('cropX').value) / 100.0).toFixed(2);
+            const y = (parseFloat(document.getElementById('cropY').value) / 100.0).toFixed(2);
+            const w = (parseFloat(document.getElementById('cropW').value) / 100.0).toFixed(2);
+            const h = (parseFloat(document.getElementById('cropH').value) / 100.0).toFixed(2);
+            apiCall(`/set_crop?x=${x}&y=${y}&w=${w}&h=${h}`);
+        }
+
+        function resetCrop() {
+            apiCall('/set_crop?reset=1');
+        }
+
+        function copyStreamUrl() {
+            const text = document.getElementById('streamUrlDisplay').innerText;
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(() => toast("Copied stream URL to clipboard", "ok"));
+            } else {
+                toast("Copied: " + text, "ok");
+            }
+        }
+
+        function pollStats() {
+            if (document.visibilityState !== 'visible') return;
+            fetch('/stats')
+                .then(r => r.json())
+                .then(d => {
+                    document.getElementById('statTemp').innerText = d.temp + ' °C';
+                    document.getElementById('statRam').innerText = d.ram_free_mb + ' / ' + d.ram_total_mb + ' MB';
+                    document.getElementById('statCpu').innerText = d.cpu_load;
+                })
+                .catch(() => {});
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            fetch('/config')
+                .then(r => r.json())
+                .then(config => {
+                    hydrate(config);
+                    setInterval(pollStats, 3000);
+                    pollStats();
+                })
+                .catch(() => toast("Failed to load initial server config", "error"));
+        });
+    </script>
+</body>
+</html>
