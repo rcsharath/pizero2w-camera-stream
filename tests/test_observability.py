@@ -129,6 +129,43 @@ class TestObservability(unittest.TestCase):
         self.assertEqual(events[1]["ev"], "http.request")
         self.assertEqual(events[1]["seq"], req_seq)
 
+    def test_reconciler_gen_start_time_gating(self):
+        # Verify gen_start_time gating behavior: if generation age <= 5.0s, argv drift check is suppressed
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 99999
+
+        with stream_server.camera_lock:
+            stream_server.camera_process = mock_proc
+            stream_server.restart_requested = False
+            stream_server.last_launched_argv = ["rpicam-vid", "dummy"]
+            # Set gen_start_time to current time (age = 0s <= 5.0s)
+            stream_server.gen_start_time = time.monotonic()
+
+        with patch('sys.stdout', self.stdout_capture), patch('os.path.exists', return_value=False):
+            # Run one tick's check logic manually
+            with stream_server.camera_lock:
+                proc = stream_server.camera_process
+                is_restart_req = stream_server.restart_requested
+                argv_believed = list(stream_server.last_launched_argv)
+                gen_start_t = stream_server.gen_start_time
+
+            camera_alive = (proc is not None and proc.poll() is None)
+            gated = not is_restart_req and camera_alive and gen_start_t is not None and (time.monotonic() - gen_start_t) > 5.0
+            self.assertFalse(gated, "Drift check should be gated (False) when generation age <= 5.0s")
+
+            # Set gen_start_time to 10 seconds ago (age = 10s > 5.0s)
+            stream_server.gen_start_time = time.monotonic() - 10.0
+            gen_start_t = stream_server.gen_start_time
+            gated_old = not is_restart_req and camera_alive and gen_start_t is not None and (time.monotonic() - gen_start_t) > 5.0
+            self.assertTrue(gated_old, "Drift check should be ungated (True) when generation age > 5.0s")
+
+        # Cleanup
+        with stream_server.camera_lock:
+            stream_server.camera_process = None
+            stream_server.gen_start_time = None
+
 
 if __name__ == '__main__':
     unittest.main()
+

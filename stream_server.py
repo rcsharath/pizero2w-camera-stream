@@ -72,6 +72,7 @@ current_gen = 0
 current_cause_seq = None
 last_launched_argv = []
 exit_timestamps = []
+gen_start_time = None
 camera_thread = None
 reconciler_thread = None
 
@@ -142,7 +143,8 @@ def validate_fps(fps_val, res_key=None):
     except (ValueError, TypeError):
         raise ValueError(f"Invalid fps parameter '{fps_val}'; must be an integer")
     if res_key is None:
-        res_key = current_res_key
+        with camera_lock:
+            res_key = current_res_key
     cap = FPS_LIMITS.get(res_key, 30)
     if not (5 <= val <= cap):
         raise ValueError(f"Invalid fps parameter '{fps_val}'; must be between 5 and {cap} for resolution '{res_key}'")
@@ -553,7 +555,8 @@ def camera_worker():
             with camera_lock:
                 camera_process = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                 pid = camera_process.pid
-                start_time = time.monotonic()
+                gen_start_time = time.monotonic()
+                start_time = gen_start_time
         except Exception as e:
             emit("camera.launch_failed", lvl="error", cause=cause_for_launch, gen=gen, error=str(e))
             time.sleep(5)
@@ -654,7 +657,6 @@ def reconciler_worker():
     tick_seq = 0
     state_file_path = get_state_file_path()
     last_state_hash = None
-    gen_start_t = time.monotonic()
 
     while True:
         time.sleep(10)
@@ -665,6 +667,7 @@ def reconciler_worker():
             gen = current_gen
             is_restart_req = restart_requested
             argv_believed = list(last_launched_argv)
+            gen_start_t = gen_start_time
 
         camera_alive = (proc is not None and proc.poll() is None)
         port_listening = check_port_listening(STREAM_TCP_PORT)
@@ -680,7 +683,7 @@ def reconciler_worker():
             emit("health.drift", lvl="error", field="worker_thread", believed="alive", observed="dead", source="thread.is_alive")
 
         # Gated drift check (not restart_requested, camera_alive, generation_age > 5.0s)
-        if not is_restart_req and camera_alive and (time.monotonic() - gen_start_t) > 5.0:
+        if not is_restart_req and camera_alive and gen_start_t is not None and (time.monotonic() - gen_start_t) > 5.0:
             try:
                 cmdline_path = f"/proc/{proc.pid}/cmdline"
                 if os.path.exists(cmdline_path):
@@ -792,7 +795,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 fps_raw = query.get('fps', [''])[0]
                 try:
-                    fps_val = validate_fps(fps_raw, current_res_key)
+                    fps_val = validate_fps(fps_raw)
                     if apply_change("fps", fps_val, cause_seq=req_seq):
                         request_restart(cause_seq=req_seq, reason="state_changed:fps")
                     with camera_lock:
@@ -996,6 +999,7 @@ def setup_crash_hooks():
         except ValueError:
             sig_name = str(signum)
         emit("server.stopping", lvl="info", signal=sig_name, reason="signal_received")
+        atexit.unregister(on_exit)
         sys.exit(0)
 
     try:
