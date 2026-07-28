@@ -134,6 +134,50 @@ class TestValidation(unittest.TestCase):
         self.assertIn("error", err)
         self.assertIn("awb", err["error"])
 
+    def test_shutter_accepted_in_range(self):
+        status, data = self._get_json("/set_exposure?shutter=50000")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["shutter"], 50000)
+
+    def test_shutter_rejected_above_6000000(self):
+        code, err = self._get_error("/set_exposure?shutter=7000000")
+        self.assertEqual(code, 400)
+        self.assertIn("error", err)
+        self.assertIn("shutter", err["error"])
+
+    def test_shutter_auto_returns_none(self):
+        status, data = self._get_json("/set_exposure?shutter=auto")
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["shutter"])
+        status, config = self._get_json("/config")
+        self.assertEqual(status, 200)
+        self.assertIsNone(config["shutter"])
+
+    def test_manual_gain_clamped_not_rejected_above_12(self):
+        status, data = self._get_json("/set_exposure?gain=15.0")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["manual_gain"], 12.0)
+
+    def test_ev_clamped_to_bounds(self):
+        status, data = self._get_json("/set_exposure?ev=15.0")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["ev"], 10.0)
+        status, data = self._get_json("/set_exposure?ev=-15.0")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["ev"], -10.0)
+
+    def test_unknown_metering_rejected(self):
+        code, err = self._get_error("/set_exposure?metering=unknown_mode")
+        self.assertEqual(code, 400)
+        self.assertIn("error", err)
+        self.assertIn("metering", err["error"])
+
+    def test_unknown_denoise_rejected(self):
+        code, err = self._get_error("/set_exposure?denoise=unknown_mode")
+        self.assertEqual(code, 400)
+        self.assertIn("error", err)
+        self.assertIn("denoise", err["error"])
+
 
 if __name__ == '__main__':
     unittest.main()

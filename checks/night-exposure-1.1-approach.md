@@ -1,0 +1,17 @@
+# Night exposure controls: locked approach
+
+Five new controls, scoped to `night_indoor` and `night_outdoor` only. Day mode's branch in `camera_worker` is not touched by this run.
+
+1. **Manual shutter cap** (`current_shutter`, microseconds, `None` = auto). When `None`, the mode's existing hardcoded shutter literal (200000 for outdoor, 66000 for indoor) is used, so default behavior is unchanged. When set, it overrides the literal. `--shutter` in `rpicam-vid` does not disable AE for gain; gain keeps floating unless a manual gain is also set (confirmed against the official option reference, cited below). Re-clamped against the current fps's frame period on every fps change and on load, mirroring `correct_roi_aspect`.
+
+2. **Manual gain override** (`current_manual_gain`, float, `None` = auto/mode-default). This is **not** a ceiling. `rpicam-vid`'s `--gain` sets one fixed combined analogue+digital value; there is no CLI-level "cap but let it float below that" mode. When `None`, the mode's existing hardcoded gain literal is used (8.0 outdoor, 4.0 indoor). When set, it pins gain exactly, same mechanism the AWB custom red/blue gains already use, and AE stops adjusting gain entirely. Name every user-facing label "Manual gain (auto if blank)", never "gain ceiling" or "max gain", because that CLI does not exist and a slider promising it would be lying to the person using it.
+
+3. **EV compensation** (`current_ev`, float, default `0.0`). Passed as `--ev`. Per the official option reference, it biases the target that the AEC/AGC algorithm converges to. It only has an observable effect on whichever axis (shutter or gain) is still under AE control. If both manual shutter and manual gain are set, EV has no visible effect; this is expected libcamera behavior, not a bug, and must be stated in the README, not engineered around.
+
+4. **Metering mode** (`current_metering`, one of `centre`/`spot`/`average`, default `centre`). Passed as `--metering` only when not the default. Same caveat as EV: only visibly changes anything on whichever axis AE still controls.
+
+5. **Denoise mode** (`current_denoise`, one of `auto`/`off`/`cdn_off`/`cdn_fast`/`cdn_hq`, default `auto`). Passed as `--denoise` only when not `auto`. **Correction to this repo's own `IMPLEMENTATION-PLAN.md`:** that file's Phase 2 claims ISP denoise is "free" because it runs off the ARM cores. The official `rpicam-apps` option reference states `cdn_hq` is "not appropriate for video/viewfinder due to reduced throughput" and that "high quality colour denoise significantly lowers framerates." It costs no ARM CPU, but it does cost achievable frame rate. The dashboard must show this as inline text next to the `cdn_hq` option, and the README addition in Phase 4 must state it plainly.
+
+**Rejected alternative:** keeping night mode fully manual (both shutter and gain always fixed, as today) and only adding EV/metering as decoration. Rejected because EV and metering would then be permanently inert controls, which is worse than not adding them, since the dashboard would offer sliders that visibly do nothing.
+
+**Rejected alternative:** a true "gain ceiling" via a custom tuning file overriding `AeConstraintMode`/max analogue gain. Rejected as out of scope: tuning-file authoring is a materially larger, separately-scoped piece of work, and Sharath asked for dashboard sliders, not a new tuning file to maintain and deploy alongside the Python server.

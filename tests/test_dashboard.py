@@ -35,6 +35,19 @@ class TestDashboard(unittest.TestCase):
             self.assertIn("location.hostname", body_text)
             self.assertEqual(body_text.count("@media"), 1)
 
+            # Night exposure tuning controls presence
+            self.assertIn("Night Exposure Tuning", body_text)
+            self.assertIn("shutterMs", body_text)
+            self.assertIn("manualGain", body_text)
+            self.assertIn("evSlider", body_text)
+            self.assertIn("meteringSelect", body_text)
+            self.assertIn("denoiseSelect", body_text)
+            self.assertIn("applyNightExposure", body_text)
+
+            # Forbidden naming assertions
+            self.assertNotIn("gain ceiling", body_text.lower())
+            self.assertNotIn("max gain", body_text.lower())
+
             self.assertNotIn("rcsharathpi", body_text)
             self.assertNotIn("stream-info-banner", body_text)
             self.assertNotIn("updateRotationUI", body_text)

@@ -56,3 +56,8 @@ Open `http://rcsharathpi.local:8000` (or `http://<pi-ip-address>:8000`) on a des
 4. **Invalid Parameter Rejection:** Issue an invalid crop parameter or invalid FPS in the URL bar (e.g. `http://rcsharathpi.local:8000/set_fps?fps=99`). Confirm a red error toast appears on screen with an explicit error reason and the process does not crash.
 5. **State Persistence Across Service Restart:** Change lighting mode to `Night Outdoor` and orientation to `180 (Inverted)`. Restart the service via SSH (`systemctl --user restart camerastream.service`). Reload the browser page and confirm `Night Outdoor` and `180 (Inverted)` persist.
 6. **Mobile Layout Check:** Open the dashboard on a smartphone (or resize desktop browser width below 700px). Verify that the status strip, control cards, crop sliders, and footer stack cleanly into a single vertical column.
+7. **Night Exposure Verification Checklist:**
+   - Test all four lighting combinations (indoor/outdoor artificial light ON/OFF) against the real bird enclosure.
+   - Apply a manual shutter cap and manual gain override from the dashboard and confirm the video feed visibly brightens or darkens accordingly.
+   - Apply manual gain values of `10.0` and `12.0` in `night_outdoor` mode; inspect `journalctl --user -u camerastream -n 30` for `camera.launch_failed` or unexpected `camera.exited` non-zero exit codes.
+   - Set an active hardware crop (ROI) and toggle metering mode between `centre`, `spot`, and `average` to test whether `--roi` influences AEC/AGC metering sampling on hardware.

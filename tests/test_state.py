@@ -75,6 +75,23 @@ class TestState(unittest.TestCase):
         import stream_server
         self.assertEqual(stream_server.current_mode, "night_outdoor")
 
+    def test_exposure_state_persistence_across_restarts(self):
+        import harness
+        base_url, shutdown = harness.start_server()
+        try:
+            req = urllib.request.Request(f"{base_url}/set_exposure?shutter=50000&gain=6.0")
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            shutdown()
+
+        if "stream_server" in sys.modules:
+            del sys.modules["stream_server"]
+
+        import stream_server
+        self.assertEqual(stream_server.current_shutter, 50000)
+        self.assertEqual(stream_server.current_manual_gain, 6.0)
+
 
 if __name__ == '__main__':
     unittest.main()

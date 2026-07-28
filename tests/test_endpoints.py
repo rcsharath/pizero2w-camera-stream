@@ -90,6 +90,19 @@ class TestEndpoints(unittest.TestCase):
             data = json.loads(resp.read().decode('utf-8'))
             self.assertIsInstance(data, dict)
 
+    def test_set_exposure(self):
+        url = f"{self.base_url}/set_exposure?shutter=60000&gain=4.0&ev=1.0&metering=spot&denoise=off"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode('utf-8'))
+            self.assertIsInstance(data, dict)
+            self.assertEqual(data["shutter"], 60000)
+            self.assertEqual(data["manual_gain"], 4.0)
+            self.assertEqual(data["ev"], 1.0)
+            self.assertEqual(data["metering"], "spot")
+            self.assertEqual(data["denoise"], "off")
+
     def test_snapshot_5xx(self):
         url = f"{self.base_url}/snapshot.jpg"
         req = urllib.request.Request(url)

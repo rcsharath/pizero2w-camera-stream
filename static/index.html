@@ -457,6 +457,56 @@
                 </div>
 
                 <div class="card">
+                    <h2 class="card-title">Night Exposure Tuning</h2>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: -0.25rem; margin-bottom: 1rem;">
+                        Applies only in Night Indoor / Night Outdoor mode
+                    </p>
+                    <div class="control-group">
+                        <div class="slider-row">
+                            <label for="shutterMs">Shutter (ms)</label>
+                            <input type="range" id="shutterMs" min="0" max="500" step="5" value="200" oninput="updateNightLabels()" disabled>
+                            <span id="shutterMsVal">Auto</span>
+                        </div>
+                        <div style="margin-top: 0.25rem; margin-bottom: 0.75rem;">
+                            <label style="font-size: 0.85rem; cursor: pointer; font-weight: normal;">
+                                <input type="checkbox" id="shutterAuto" checked onchange="toggleShutterAuto()"> Auto shutter
+                            </label>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <div class="slider-row">
+                            <label for="manualGain">Manual gain (auto if blank)</label>
+                            <input type="range" id="manualGain" min="1.0" max="12.0" step="0.5" value="8.0" oninput="updateNightLabels()" disabled>
+                            <span id="manualGainVal">Auto</span>
+                        </div>
+                        <div style="margin-top: 0.25rem; margin-bottom: 0.75rem;">
+                            <label style="font-size: 0.85rem; cursor: pointer; font-weight: normal;">
+                                <input type="checkbox" id="gainAuto" checked onchange="toggleGainAuto()"> Auto gain
+                            </label>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <div class="slider-row">
+                            <label for="evSlider">EV Compensation</label>
+                            <input type="range" id="evSlider" min="-10" max="10" step="1" value="0" oninput="updateNightLabels()">
+                            <span id="evVal">0</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label for="meteringSelect">Metering Mode</label>
+                        <select id="meteringSelect"></select>
+                    </div>
+                    <div class="control-group">
+                        <label for="denoiseSelect">Denoise Mode</label>
+                        <select id="denoiseSelect" onchange="onDenoiseChange()"></select>
+                        <p id="denoiseWarning" style="display: none; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">
+                            Significantly reduces achievable framerate at night (rpicam-vid docs).
+                        </p>
+                    </div>
+                    <button class="btn" onclick="applyNightExposure()">Apply Night Exposure</button>
+                </div>
+
+                <div class="card">
                     <h2 class="card-title">Color Balance</h2>
                     <div class="control-group">
                         <label for="awbSelect">AWB Mode</label>
@@ -648,6 +698,71 @@
                 customGainsGroup.style.display = 'none';
             }
 
+            // Night Exposure Tuning hydration
+            const shutterMs = document.getElementById('shutterMs');
+            const shutterAuto = document.getElementById('shutterAuto');
+            if (config.shutter !== undefined && config.shutter !== null) {
+                shutterAuto.checked = false;
+                shutterMs.disabled = false;
+                shutterMs.value = Math.round(config.shutter / 1000);
+            } else {
+                shutterAuto.checked = true;
+                shutterMs.disabled = true;
+            }
+
+            const manualGain = document.getElementById('manualGain');
+            const gainAuto = document.getElementById('gainAuto');
+            if (config.manual_gain !== undefined && config.manual_gain !== null) {
+                gainAuto.checked = false;
+                manualGain.disabled = false;
+                manualGain.value = config.manual_gain;
+            } else {
+                gainAuto.checked = true;
+                manualGain.disabled = true;
+            }
+
+            if (config.ev !== undefined && config.ev !== null) {
+                document.getElementById('evSlider').value = config.ev;
+            }
+
+            const meteringSelect = document.getElementById('meteringSelect');
+            meteringSelect.innerHTML = '';
+            const meteringLabels = {
+                "centre": "Centre Weighted (Default)",
+                "spot": "Spot Metering",
+                "average": "Average Metering"
+            };
+            if (config.metering_modes) {
+                config.metering_modes.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m;
+                    opt.innerText = meteringLabels[m] || m;
+                    if (m === config.metering) opt.selected = true;
+                    meteringSelect.appendChild(opt);
+                });
+            }
+
+            const denoiseSelect = document.getElementById('denoiseSelect');
+            denoiseSelect.innerHTML = '';
+            const denoiseLabels = {
+                "auto": "Auto (Default)",
+                "off": "Off",
+                "cdn_off": "CDN Off",
+                "cdn_fast": "CDN Fast",
+                "cdn_hq": "CDN High Quality (Reduces FPS)"
+            };
+            const denoiseModes = config.denoise_modes || ["auto", "off", "cdn_off", "cdn_fast", "cdn_hq"];
+            denoiseModes.forEach(d => {
+                const opt = document.createElement('option');
+                opt.value = d;
+                opt.innerText = denoiseLabels[d] || d;
+                if (d === config.denoise) opt.selected = true;
+                denoiseSelect.appendChild(opt);
+            });
+
+            updateNightLabels();
+            onDenoiseChange();
+
             // ROI Crop sliders
             if (config.roi) {
                 const parts = config.roi.split(',');
@@ -665,6 +780,70 @@
             }
             clampCropOffsets();
             updateCropLabels();
+        }
+
+        function updateNightLabels() {
+            const shutterAuto = document.getElementById('shutterAuto');
+            const shutterMs = document.getElementById('shutterMs');
+            const shutterMsVal = document.getElementById('shutterMsVal');
+            if (shutterAuto.checked) {
+                shutterMsVal.innerText = 'Auto';
+            } else {
+                shutterMsVal.innerText = shutterMs.value + ' ms';
+            }
+
+            const gainAuto = document.getElementById('gainAuto');
+            const manualGain = document.getElementById('manualGain');
+            const manualGainVal = document.getElementById('manualGainVal');
+            if (gainAuto.checked) {
+                manualGainVal.innerText = 'Auto';
+            } else {
+                manualGainVal.innerText = parseFloat(manualGain.value).toFixed(1);
+            }
+
+            const evSlider = document.getElementById('evSlider');
+            document.getElementById('evVal').innerText = evSlider.value;
+        }
+
+        function toggleShutterAuto() {
+            const shutterAuto = document.getElementById('shutterAuto');
+            const shutterMs = document.getElementById('shutterMs');
+            shutterMs.disabled = shutterAuto.checked;
+            updateNightLabels();
+        }
+
+        function toggleGainAuto() {
+            const gainAuto = document.getElementById('gainAuto');
+            const manualGain = document.getElementById('manualGain');
+            manualGain.disabled = gainAuto.checked;
+            updateNightLabels();
+        }
+
+        function onDenoiseChange() {
+            const denoiseSelect = document.getElementById('denoiseSelect');
+            const warning = document.getElementById('denoiseWarning');
+            if (denoiseSelect.value === 'cdn_hq') {
+                warning.style.display = 'block';
+            } else {
+                warning.style.display = 'none';
+            }
+        }
+
+        function applyNightExposure() {
+            const shutterAuto = document.getElementById('shutterAuto').checked;
+            const shutterMs = document.getElementById('shutterMs').value;
+            const shutterVal = shutterAuto ? 'auto' : (parseInt(shutterMs) * 1000);
+
+            const gainAuto = document.getElementById('gainAuto').checked;
+            const manualGain = document.getElementById('manualGain').value;
+            const gainVal = gainAuto ? 'auto' : manualGain;
+
+            const evVal = document.getElementById('evSlider').value;
+            const meteringVal = document.getElementById('meteringSelect').value;
+            const denoiseVal = document.getElementById('denoiseSelect').value;
+
+            const url = `/set_exposure?shutter=${encodeURIComponent(shutterVal)}&gain=${encodeURIComponent(gainVal)}&ev=${encodeURIComponent(evVal)}&metering=${encodeURIComponent(meteringVal)}&denoise=${encodeURIComponent(denoiseVal)}`;
+            apiCall(url);
         }
 
         function changeResolution(val) {

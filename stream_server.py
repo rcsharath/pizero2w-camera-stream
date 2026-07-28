@@ -46,6 +46,8 @@ FPS_LIMITS = {
 VALID_MODES = frozenset({"day", "night_indoor", "night_outdoor"})
 VALID_AWB = frozenset({"auto", "indoor", "incandescent", "tungsten", "custom"})
 VALID_ROTATIONS = frozenset({"0", "180", "hflip", "vflip"})
+VALID_METERING = frozenset({"centre", "spot", "average"})
+VALID_DENOISE = frozenset({"auto", "off", "cdn_off", "cdn_fast", "cdn_hq"})
 
 current_res_key = "1296x972"
 current_width, current_height, _ = RESOLUTIONS[current_res_key]
@@ -58,6 +60,11 @@ current_awb = "auto"  # auto, indoor, incandescent, tungsten, custom
 current_red_gain = 1.70
 current_blue_gain = 1.40
 current_rotation = "0"  # "0", "180", "hflip", "vflip"
+current_shutter = None
+current_manual_gain = None
+current_ev = 0.0
+current_metering = "centre"
+current_denoise = "auto"
 
 # Global process & camera state (Reentrant lock prevents handler deadlocks)
 camera_process = None
@@ -181,6 +188,65 @@ def validate_rotation(rot_val):
     return rot_str
 
 
+def validate_shutter(val):
+    if val is None:
+        return None
+    if isinstance(val, str):
+        val_str = val.strip()
+        if val_str == "" or val_str.lower() == "auto":
+            return None
+    try:
+        shutter_int = int(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid shutter parameter '{val}'; must be an integer or 'auto'")
+    if not (0 <= shutter_int <= 6000000):
+        raise ValueError(f"Invalid shutter parameter '{val}'; must be between 0 and 6000000")
+    return shutter_int
+
+
+def correct_shutter_for_fps(shutter_us, fps):
+    if shutter_us is None:
+        return None
+    max_shutter = 1_000_000 // int(fps)
+    return min(int(shutter_us), max_shutter)
+
+
+def validate_manual_gain(val):
+    if val is None:
+        return None
+    if isinstance(val, str):
+        val_str = val.strip()
+        if val_str == "" or val_str.lower() == "auto":
+            return None
+    try:
+        gain_float = float(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid manual_gain parameter '{val}'; must be a number or 'auto'")
+    return max(1.0, min(12.0, gain_float))
+
+
+def validate_ev(val):
+    try:
+        ev_float = float(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid ev parameter '{val}'; must be a number")
+    return max(-10.0, min(10.0, ev_float))
+
+
+def validate_metering(val):
+    val_str = str(val).lower() if val is not None else ""
+    if val_str not in VALID_METERING:
+        raise ValueError(f"Invalid metering parameter '{val}'; must be one of {sorted(list(VALID_METERING))}")
+    return val_str
+
+
+def validate_denoise(val):
+    val_str = str(val).lower() if val is not None else ""
+    if val_str not in VALID_DENOISE:
+        raise ValueError(f"Invalid denoise parameter '{val}'; must be one of {sorted(list(VALID_DENOISE))}")
+    return val_str
+
+
 def clamp_gain(gain_val, param_name="gain"):
     try:
         val = float(gain_val)
@@ -265,11 +331,18 @@ def current_state_dict():
         "blue_gain": current_blue_gain,
         "roi": current_roi,
         "rotation": current_rotation,
+        "shutter": current_shutter,
+        "manual_gain": current_manual_gain,
+        "ev": current_ev,
+        "metering": current_metering,
+        "denoise": current_denoise,
         "resolutions": resolutions_map,
         "fps_limits": dict(FPS_LIMITS),
         "modes": ["day", "night_indoor", "night_outdoor"],
         "awb_modes": ["auto", "indoor", "incandescent", "tungsten", "custom"],
         "rotations": ["0", "180", "hflip", "vflip"],
+        "metering_modes": sorted(list(VALID_METERING)),
+        "denoise_modes": ["auto", "off", "cdn_off", "cdn_fast", "cdn_hq"],
         "stream_port": STREAM_TCP_PORT
     }
 
@@ -292,6 +365,11 @@ def save_state():
             "blue_gain": current_blue_gain,
             "roi": current_roi,
             "rotation": current_rotation,
+            "shutter": current_shutter,
+            "manual_gain": current_manual_gain,
+            "ev": current_ev,
+            "metering": current_metering,
+            "denoise": current_denoise,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -315,6 +393,7 @@ def apply_change(field_name: str, new_value, cause_seq: int = None) -> bool:
     """
     global current_res_key, current_width, current_height, current_fps
     global current_mode, current_awb, current_red_gain, current_blue_gain, current_roi, current_rotation
+    global current_shutter, current_manual_gain, current_ev, current_metering, current_denoise
 
     with camera_lock:
         if field_name == "resolution":
@@ -334,6 +413,7 @@ def apply_change(field_name: str, new_value, cause_seq: int = None) -> bool:
                 current_fps = cap
         elif field_name == "fps":
             current_fps = new_value
+            current_shutter = correct_shutter_for_fps(current_shutter, current_fps)
         elif field_name == "mode":
             current_mode = new_value
         elif field_name == "awb":
@@ -346,6 +426,16 @@ def apply_change(field_name: str, new_value, cause_seq: int = None) -> bool:
             current_roi = new_value
         elif field_name == "rotation":
             current_rotation = new_value
+        elif field_name == "shutter":
+            current_shutter = new_value
+        elif field_name == "manual_gain":
+            current_manual_gain = new_value
+        elif field_name == "ev":
+            current_ev = new_value
+        elif field_name == "metering":
+            current_metering = new_value
+        elif field_name == "denoise":
+            current_denoise = new_value
 
         save_state()
         emit("state.changed", lvl="info", cause=cause_seq, field=field_name, **{"from": old_val, "to": new_value})
@@ -355,6 +445,7 @@ def apply_change(field_name: str, new_value, cause_seq: int = None) -> bool:
 def load_state():
     global current_res_key, current_width, current_height, current_fps
     global current_mode, current_awb, current_red_gain, current_blue_gain, current_roi, current_rotation
+    global current_shutter, current_manual_gain, current_ev, current_metering, current_denoise
 
     path = get_state_file_path()
     if not os.path.exists(path):
@@ -454,6 +545,46 @@ def load_state():
             rejected.append("rotation")
             emit("state.key_rejected", lvl="warn", key="rotation", value=data.get("rotation"), reason=str(e))
 
+    if "shutter" in data:
+        try:
+            current_shutter = validate_shutter(data["shutter"])
+            accepted.append("shutter")
+        except ValueError as e:
+            rejected.append("shutter")
+            emit("state.key_rejected", lvl="warn", key="shutter", value=data.get("shutter"), reason=str(e))
+
+    if "manual_gain" in data:
+        try:
+            current_manual_gain = validate_manual_gain(data["manual_gain"])
+            accepted.append("manual_gain")
+        except ValueError as e:
+            rejected.append("manual_gain")
+            emit("state.key_rejected", lvl="warn", key="manual_gain", value=data.get("manual_gain"), reason=str(e))
+
+    if "ev" in data:
+        try:
+            current_ev = validate_ev(data["ev"])
+            accepted.append("ev")
+        except ValueError as e:
+            rejected.append("ev")
+            emit("state.key_rejected", lvl="warn", key="ev", value=data.get("ev"), reason=str(e))
+
+    if "metering" in data:
+        try:
+            current_metering = validate_metering(data["metering"])
+            accepted.append("metering")
+        except ValueError as e:
+            rejected.append("metering")
+            emit("state.key_rejected", lvl="warn", key="metering", value=data.get("metering"), reason=str(e))
+
+    if "denoise" in data:
+        try:
+            current_denoise = validate_denoise(data["denoise"])
+            accepted.append("denoise")
+        except ValueError as e:
+            rejected.append("denoise")
+            emit("state.key_rejected", lvl="warn", key="denoise", value=data.get("denoise"), reason=str(e))
+
     # Self-heal: a crop persisted under one resolution (or hand-edited, or written
     # before this correction existed) can be aspect-mismatched against whatever
     # resolution just loaded. Fix it here so a stale state.json can never produce
@@ -465,6 +596,8 @@ def load_state():
             emit("state.key_corrected", lvl="warn", key="roi", **{"from": current_roi, "to": corrected_roi}, reason="aspect_mismatch_with_resolution")
             current_roi = corrected_roi
             save_state()
+
+    current_shutter = correct_shutter_for_fps(current_shutter, current_fps)
 
     emit("state.loaded", lvl="info", path=path, accepted=accepted, rejected=rejected)
 
@@ -574,6 +707,11 @@ def camera_worker():
             red_g = current_red_gain
             blue_g = current_blue_gain
             rot = current_rotation
+            shutter = current_shutter
+            manual_gain = current_manual_gain
+            ev = current_ev
+            metering = current_metering
+            denoise = current_denoise
             restart_requested = False
             cause_for_launch = current_cause_seq
 
@@ -590,9 +728,25 @@ def camera_worker():
         ]
 
         if mode == "night_outdoor":
-            cmd.extend(["--shutter", "200000", "--gain", "8.0", "--awbgains", "1.80,1.30"])
+            effective_shutter = shutter if shutter is not None else 200000
+            effective_gain = manual_gain if manual_gain is not None else 8.0
+            cmd.extend(["--shutter", str(effective_shutter), "--gain", str(effective_gain), "--awbgains", "1.80,1.30"])
+            if ev != 0.0:
+                cmd.extend(["--ev", str(ev)])
+            if metering != "centre":
+                cmd.extend(["--metering", metering])
+            if denoise != "auto":
+                cmd.extend(["--denoise", denoise])
         elif mode == "night_indoor":
-            cmd.extend(["--shutter", "66000", "--gain", "4.0", "--awbgains", "1.70,1.40"])
+            effective_shutter = shutter if shutter is not None else 66000
+            effective_gain = manual_gain if manual_gain is not None else 4.0
+            cmd.extend(["--shutter", str(effective_shutter), "--gain", str(effective_gain), "--awbgains", "1.70,1.40"])
+            if ev != 0.0:
+                cmd.extend(["--ev", str(ev)])
+            if metering != "centre":
+                cmd.extend(["--metering", metering])
+            if denoise != "auto":
+                cmd.extend(["--denoise", denoise])
         else:
             if awb == "custom":
                 cmd.extend(["--awb", "custom", "--awbgains", f"{red_g},{blue_g}"])
@@ -969,6 +1123,40 @@ class StreamHandler(BaseHTTPRequestHandler):
                         state = current_state_dict()
                 except ValueError as e:
                     emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="rot", value=rot_raw, reason=str(e))
+                    self._send_error(str(e), status=400, is_head=is_head)
+                    dur_ms = int((time.monotonic() - start_t) * 1000)
+                    emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)
+                    return
+                self._send_json(state, status=200, is_head=is_head)
+                dur_ms = int((time.monotonic() - start_t) * 1000)
+                emit("http.request", lvl="info", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=200, dur_ms=dur_ms)
+
+            elif parsed.path == '/set_exposure':
+                query = parse_qs(parsed.query)
+                try:
+                    c_shutter = False
+                    c_gain = False
+                    c_ev = False
+                    c_metering = False
+                    c_denoise = False
+                    if 'shutter' in query:
+                        c_shutter = apply_change("shutter", validate_shutter(query['shutter'][0]), cause_seq=req_seq)
+                    if 'gain' in query:
+                        c_gain = apply_change("manual_gain", validate_manual_gain(query['gain'][0]), cause_seq=req_seq)
+                    if 'ev' in query:
+                        c_ev = apply_change("ev", validate_ev(query['ev'][0]), cause_seq=req_seq)
+                    if 'metering' in query:
+                        c_metering = apply_change("metering", validate_metering(query['metering'][0]), cause_seq=req_seq)
+                    if 'denoise' in query:
+                        c_denoise = apply_change("denoise", validate_denoise(query['denoise'][0]), cause_seq=req_seq)
+
+                    if c_shutter or c_gain or c_ev or c_metering or c_denoise:
+                        request_restart(cause_seq=req_seq, reason="state_changed:exposure")
+
+                    with camera_lock:
+                        state = current_state_dict()
+                except ValueError as e:
+                    emit("http.rejected", lvl="warn", cause=req_seq, path=parsed.path, param="exposure", value=str(query), reason=str(e))
                     self._send_error(str(e), status=400, is_head=is_head)
                     dur_ms = int((time.monotonic() - start_t) * 1000)
                     emit("http.request", lvl="warn", seq=req_seq, method=self.command, path=parsed.path, query=parsed.query, client_ip=self.client_address[0], status=400, dur_ms=dur_ms)

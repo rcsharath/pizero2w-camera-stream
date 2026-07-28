@@ -116,7 +116,20 @@ Mutating endpoints return the full server `/config` state on success. On invalid
 | `/set_mode` | `GET` | `mode=day` / `night_outdoor` / `night_indoor` | Configures shutter exposure & gain presets. |
 | `/set_crop` | `GET` | `x`, `y`, `w`, `h` (0.0 to 1.0) or `reset=1` | Applies hardware region-of-interest crop in VideoCore GPU. |
 | `/set_awb` | `GET` | `mode` (auto, indoor, etc.) & `red`, `blue` | Applies white balance & custom red/blue gain multipliers. |
+| `/set_exposure` | `GET` | `shutter`, `gain`, `ev`, `metering`, `denoise` | Configures night-mode manual exposure, gain override, EV, metering, and denoise. |
 | `/snapshot.jpg` | `GET` | None | Captures and downloads a full 5MP (2592×1944) JPEG image. |
+
+---
+
+## 🌙 Night Exposure Controls
+
+In `night_indoor` and `night_outdoor` modes, five exposure controls are exposed via the web dashboard and `/set_exposure`:
+
+1. **Manual shutter cap (`shutter`):** Microseconds (e.g. `200000` = 200ms). When set to `auto` / `null`, uses mode defaults (200ms for outdoor, 66ms for indoor). Re-clamped automatically on FPS changes to not exceed the frame period (`1_000_000 // fps`).
+2. **Manual gain override (`gain`):** Floating point combined analogue+digital gain (range `1.0` to `12.0`). **Note: Manual gain is a fixed override, not a ceiling.** `rpicam-vid`'s `--gain` pins analogue+digital gain fixedly; there is no CLI-level max gain ceiling flag.
+3. **EV compensation (`ev`):** Floating point EV bias (range `-10.0` to `10.0`). Biases the target AEC/AGC converges to. EV and metering only affect an axis still under AE control (if both manual shutter and manual gain are set, AE is fully disabled and EV has no visual effect).
+4. **Metering mode (`metering`):** `centre`, `spot`, or `average`. Only affects axes still under auto-exposure control.
+5. **Denoise mode (`denoise`):** `auto`, `off`, `cdn_off`, `cdn_fast`, or `cdn_hq`. **Note:** `cdn_hq` (High Quality Colour Denoise) significantly lowers achievable framerates at night per official `rpicam-apps` documentation; it is not a free operation.
 
 ---
 
